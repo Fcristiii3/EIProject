@@ -1,0 +1,27 @@
+# ROS 2 Build, Install, and Log artifacts
+build/
+install/
+log/
+
+# Python compiled bytecode & cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+
+# C++ compiled object files and binaries
+*.o
+*.so
+*.a
+*.out
+
+# IDE and Editor settings
+.vscode/
+.idea/
+*.swp
+*~
+
+# OS generated files
+.DS_Store
+Thumbs.db
