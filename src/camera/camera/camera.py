@@ -8,6 +8,8 @@ from cv_bridge import CvBridge
 from sensor_msgs.msg import Image
 from geometry_msgs.msg import Point
 
+from ultralytics import YOLOWorld
+
 class CameraNode(Node):
     def __init__(self):
         super().__init__('camera_node')
@@ -19,11 +21,23 @@ class CameraNode(Node):
         self.paperWidth = 210
         self.pointsClicked=[]
         self.calibrated=False
-        self.cupColorLow = None
-        self.cupColorHigh = None
         self.H = None
 
-        self.get_logger().info("click 4 points for paper corners, 1 for arm base, 1 for cup color")
+        self.get_logger().info("yolo")
+        self.model = YOLOWorld("yolov8s-worldv2.pt")
+        self.model.set_classes(["cup","mug","plastic cup","festival plastic cup","hand","hand palm", "hand back", "person hand", "human hand","water bottle","bottle","plastic bottle"])
+
+        self.frame_count = 0
+        self.process_every_n_frames = 2
+        self.latest_boxes = []
+        
+
+        self.cupHistory =[]
+        self.historyLength = 5
+        self.cupThreshold = 3.0
+        self.gameState = "Human"
+
+        self.get_logger().info("click 4 points for paper corners, 1 for arm base")
 
         self.cap = cv2.VideoCapture(0, cv2.CAP_V4L2)
         self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
@@ -33,9 +47,13 @@ class CameraNode(Node):
         cv2.namedWindow("camera")
         cv2.setMouseCallback("camera", self.clickCorners)
 
-        self.timer = self.create_timer(0.1, self.timer_callback)
+        self.timer = self.create_timer(0.05, self.timer_callback)    
 
     def timer_callback(self):
+
+        for _ in range(2):
+            self.cap.grab()
+
         ret, frame = self.cap.read()
         if not ret:
             self.get_logger().error("no frames captured")
@@ -50,7 +68,7 @@ class CameraNode(Node):
                 else:
                     color=(0, 0, 255)
                 cv2.circle(frame, point, 5, color, -1)
-            if len(self.pointsClicked) == 6:
+            if len(self.pointsClicked) == 5:
                 self.calibrateCoords(frameNoPoint)
         else:
             self.processFrame(frame)
@@ -59,7 +77,7 @@ class CameraNode(Node):
 
     def clickCorners(self, event, x, y, flags, param):
         if event == cv2.EVENT_LBUTTONDOWN and not self.calibrated:
-            if len(self.pointsClicked) < 6:
+            if len(self.pointsClicked) < 5:
                 self.pointsClicked.append((x, y))
                 pointsLength = len(self.pointsClicked)
                 self.get_logger().info(f"Point clicked: ({x}, {y}) for the {pointsLength} point")
@@ -68,7 +86,6 @@ class CameraNode(Node):
     def calibrateCoords(self, frame):
         paper_points = np.array(self.pointsClicked[:4], dtype=np.float32)
         robot_points = np.array(self.pointsClicked[4], dtype=np.float32)
-        cup_points = np.array(self.pointsClicked[5], dtype=np.float32)
 
         paper_size = np.array([[0, 0], [self.paperWidth, 0], [self.paperWidth, self.paperHeight], [0, self.paperHeight]], dtype=np.float32)
         H_paper = cv2.getPerspectiveTransform(paper_points, paper_size)
@@ -81,59 +98,78 @@ class CameraNode(Node):
         mappedRobotPoints = paper_size - np.array([[robotX, robotY]], dtype=np.float32)
         self.H, _ = cv2.findHomography(paper_points, mappedRobotPoints)
 
-        cx, cy = int(cup_points[0]), int(cup_points[1])
-        poi = frame[max(0, cy-2):cy+3, max(0, cx-2):cx+3]
-        avg = np.mean(poi, axis=(0, 1))
-
-        self.get_logger().info(f"h:{avg[0]}, s:{avg[1]}, v:{avg[2]}")
-
-        self.cupColorLow = np.array([max(0, avg[0]-10), max(0, avg[1]-50), max(0, avg[2]-50)], dtype=np.uint8)
-        self.cupColorHigh = np.array([min(255, avg[0]+10), min(255, avg[1]+50), min(255, avg[2]+50)], dtype=np.uint8)
-
-        self.get_logger().info(f"cup color low: {self.cupColorLow}, cup color high: {self.cupColorHigh}")
-
         self.calibrated = True
         self.get_logger().info("calibration complete")
 
     def processFrame(self, frame):
+        self.frame_count += 1
+        if self.frame_count % self.process_every_n_frames != 0:
+            results = self.model(frame, verbose=False, conf=0.2)[0]
+            self.latest_boxes = results.boxes
+
+        for box in self.latest_boxes:
+            cls_id = int(box.cls[0])
+            conf = float(box.conf[0])
+            label_name = self.model.names[cls_id]
+            self.get_logger().info(f"Detected: {label_name} ({conf:.2f})")
         
-        mask = cv2.inRange(frame, self.cupColorLow, self.cupColorHigh)
+        
 
-        kernel = np.ones((5, 5), np.uint8)
-        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+        cupCenter = None
+        handFlag = False
+        for box in self.latest_boxes:
+            label = self.model.names[int(box.cls[0])]
+            x1, y1, x2, y2 = map(int, box.xyxy[0])
 
-        #self.get_logger().info("entered here")
-        #mask = cv2.inRange(hsv, np.array([0, 30, 30]), np.array([180, 255, 255]))
-        cv2.imshow("mask", mask)
-        cv2.waitKey(1)
+            if "hand" in label.lower():
+                handFlag = True
+                cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 0, 255), 2)
+                cv2.putText(frame, label, (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 0, 255), 2)
+            elif "cup" in label.lower() or "mug" in label.lower() or "bottle" in label.lower():
+                cupCenter = ((x1 + x2) // 2, (y1 + y2) // 2)
+                cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                cv2.putText(frame, label, (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 0), 2)
+        self.updateGameState(cupCenter, handFlag)
+        cv2.putText(frame, f"Game State: {self.gameState}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
 
+    def updateGameState(self, cupCenter, handFlag):
+        if self.gameState == "Human":
+            if cupCenter is not None:
+                self.cupHistory.append(cupCenter)
+                if len(self.cupHistory) > self.historyLength:
+                    self.cupHistory.pop(0)
+                
+                if not handFlag and self.cupAvailable():
+                    self.gameState = "Robot"
+                    self.get_logger().info("Switching to Robot state")
 
-        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        for contour in contours:
-            area = cv2.contourArea(contour)
-            
-            if area > 200:
-                M = cv2.moments(contour)
-                if M["m00"] != 0:
-                    cx = float(M["m10"] / M["m00"])
-                    cy = float(M["m01"] / M["m00"])
-                    cv2.circle(frame, (int(cx), int(cy)), 5, (0, 255, 0), -1)
-                    cv2.putText(frame, f"({cx}, {cy})", (int(cx) + 10, int(cy)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
-                    pixels=np.array([cx, cy, 1.0], dtype=np.float32).reshape(3, 1)
-                    world_coords = np.dot(self.H, pixels)
-                    self.get_logger().info(f"World Coordinates: ({world_coords[0][0]}, {world_coords[1][0]})")
-
-                    robotX = world_coords[0] / world_coords[2]
-                    robotY = world_coords[1] / world_coords[2]
-                    self.get_logger().info(f"Robot Coordinates: ({robotX[0]}, {robotY[0]})")
+                    cx,cy = self.cupHistory[-1]
+                    pixels = np.array([[cx, cy, 1.0]], dtype=np.float32).reshape(3,1)
+                    worldCoord = np.dot(self.H, pixels)
+                    robotX = (worldCoord[0] / worldCoord[2])[0]
+                    robotY = (worldCoord[1] / worldCoord[2])[0]
 
                     msg = Point()
-                    msg.x = robotX[0]/1000.0
-                    msg.y = robotY[0]/1000.0
+                    msg.x = robotX
+                    msg.y = robotY
                     msg.z = 0.0
                     self.robot_pub.publish(msg)
-                    self.get_logger().info(f"cup position relative to robot:({robotX[0]/1000.0}, {robotY[0]/1000.0}, {msg.z})")
 
+                    self.get_logger().info(f"Published robot coordinates: x={robotX}, y={robotY}")
+        elif self.gameState == "Robot":
+            if handFlag:
+                self.gameState = "Human"
+                self.get_logger().info("Switching to Human state")
+                self.cupHistory.clear()
+                
+
+    def cupAvailable(self):
+        if len(self.cupHistory) < self.historyLength:
+            return False
+        coord = np.array(self.cupHistory)
+        std_dev = np.std(coord, axis=0)
+        return float(std_dev[0]) < self.cupThreshold and float(std_dev[1]) < self.cupThreshold
+        
 
 def main(args=None):
     rclpy.init(args=args)
