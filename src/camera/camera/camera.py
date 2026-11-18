@@ -15,7 +15,7 @@ class CameraNode(Node):
         super().__init__('camera_node')
         self.bridge = CvBridge()
 
-        self.robot_pub = self.create_publisher(Point, '/robot/pose', 10)
+        self.robot_pub = self.create_publisher(Point, '/comput_game/camera_coordinates', 10)
         
         self.paperHeight = 297
         self.paperWidth = 210
@@ -80,14 +80,19 @@ class CameraNode(Node):
             if len(self.pointsClicked) < 5:
                 self.pointsClicked.append((x, y))
                 pointsLength = len(self.pointsClicked)
-                self.get_logger().info(f"Point clicked: ({x}, {y}) for the {pointsLength} point")
+                self.get_logger().info(f"clicked {x} {y} for the {pointsLength} point")
 
 
     def calibrateCoords(self, frame):
         paper_points = np.array(self.pointsClicked[:4], dtype=np.float32)
         robot_points = np.array(self.pointsClicked[4], dtype=np.float32)
 
-        paper_size = np.array([[0, 0], [self.paperWidth, 0], [self.paperWidth, self.paperHeight], [0, self.paperHeight]], dtype=np.float32)
+        paper_size = np.array([[0, 0], 
+        [self.paperWidth, 0], 
+        [self.paperWidth, self.paperHeight], 
+        [0, self.paperHeight]], 
+        dtype=np.float32)
+        
         H_paper = cv2.getPerspectiveTransform(paper_points, paper_size)
 
         rx, ry = robot_points
@@ -103,7 +108,7 @@ class CameraNode(Node):
 
     def processFrame(self, frame):
         self.frame_count += 1
-        if self.frame_count % self.process_every_n_frames != 0:
+        if self.frame_count % self.process_every_n_frames == 0:
             results = self.model(frame, verbose=False, conf=0.2)[0]
             self.latest_boxes = results.boxes
 

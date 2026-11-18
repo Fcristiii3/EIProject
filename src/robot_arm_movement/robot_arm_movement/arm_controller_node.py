@@ -18,7 +18,7 @@ class ComputRhythmArmController(Node):
         self.target_sub = self.create_subscription(String, '/comput_game/target_action', self.game_action_callback, 10)
         self.coord_sub = self.create_subscription(Point, '/comput_game/camera_coordinates', self.camera_coord_callback, 10)
         self.declare_parameter('tempo_scale', 1.0)
-        self.declare_parameter('mock_mode_enabled', True)
+        self.declare_parameter('mock_mode_enabled', False)
         self.declare_parameter('mock_execution_delay', 0.3)
         self.declare_parameter('controller_discovery_timeout_sec', 15.0)
         self.arm_joint_names=None
