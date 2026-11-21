@@ -8,7 +8,9 @@ from cv_bridge import CvBridge
 from sensor_msgs.msg import Image
 from geometry_msgs.msg import Point
 
-from ultralytics import YOLOWorld
+import mediapipe as mp
+from mediapipe.tasks import python
+from mediapipe.tasks.python import vision
 
 class CameraNode(Node):
     def __init__(self):
@@ -16,28 +18,42 @@ class CameraNode(Node):
         self.bridge = CvBridge()
 
         self.robot_pub = self.create_publisher(Point, '/comput_game/camera_coordinates', 10)
-        
-        self.paperHeight = 297
-        self.paperWidth = 210
-        self.pointsClicked=[]
-        self.calibrated=False
-        self.H = None
 
-        self.get_logger().info("yolo")
-        self.model = YOLOWorld("yolov8s-worldv2.pt")
-        self.model.set_classes(["cup","mug","plastic cup","festival plastic cup","hand","hand palm", "hand back", "person hand", "human hand","water bottle","bottle","plastic bottle"])
-
-        self.frame_count = 0
-        self.process_every_n_frames = 2
-        self.latest_boxes = []
+        tempo=0 
         
+        try:
+            calibData = np.load("camera_calibration.npz")
+        except FileNotFoundError:
+            self.get_logger().error("Camera calibration file not found")
+            return
+
+        self.camera_matrix = calibData['camera_matrix']
+        self.dist_coeff = calibData['dist_coeff']
+        self.robotBaseID=0
+        self.cupID=1
+
+        #aruco sizes
+        self.MARKER_SIZE = 0.05
+        self.dictionary = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_50)
+        self.parameters = cv2.aruco.DetectorParameters()
+        self.detector = cv2.aruco.ArucoDetector(self.dictionary, self.parameters)
+
+        baseOptions = python.BaseOptions(model_asset_path='hand_landmarker.task')
+        options = vision.HandLandmarkerOptions(
+            base_options=baseOptions,
+            running_mode=vision.RunningMode.IMAGE,
+            num_hands=2,
+            min_hand_detection_confidence=0.4,
+            min_hand_presence_confidence=0.4,
+            min_tracking_confidence=0.4
+        )
+        self.landmarker = vision.HandLandmarker.create_from_options(options)
 
         self.cupHistory =[]
         self.historyLength = 5
         self.cupThreshold = 3.0
         self.gameState = "Human"
 
-        self.get_logger().info("click 4 points for paper corners, 1 for arm base")
 
         self.cap = cv2.VideoCapture(0, cv2.CAP_V4L2)
         self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
@@ -45,7 +61,6 @@ class CameraNode(Node):
         self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
 
         cv2.namedWindow("camera")
-        cv2.setMouseCallback("camera", self.clickCorners)
 
         self.timer = self.create_timer(0.05, self.timer_callback)    
 
@@ -58,123 +73,136 @@ class CameraNode(Node):
         if not ret:
             self.get_logger().error("no frames captured")
             return
-        frameNoPoint = frame.copy()
-        if not self.calibrated:
-            for i, point in enumerate(self.pointsClicked):
-                if i < 4:
-                    color=(0, 255, 0)  
-                elif i == 4:
-                    color=(255, 0, 0)
-                else:
-                    color=(0, 0, 255)
-                cv2.circle(frame, point, 5, color, -1)
-            if len(self.pointsClicked) == 5:
-                self.calibrateCoords(frameNoPoint)
-        else:
-            self.processFrame(frame)
+        
+        corners, ids, _ = self.detector.detectMarkers(frame)
+        poses = {}
+        if ids is not None:
+            cv2.aruco.drawDetectedMarkers(frame, corners, ids)
+            for idx, marker_id in enumerate(ids.flatten()):
+                obj_pts = np.array([
+                    [-self.MARKER_SIZE/2,  self.MARKER_SIZE/2, 0],
+                    [ self.MARKER_SIZE/2,  self.MARKER_SIZE/2, 0],
+                    [ self.MARKER_SIZE/2, -self.MARKER_SIZE/2, 0],
+                    [-self.MARKER_SIZE/2, -self.MARKER_SIZE/2, 0]
+                ], dtype=np.float32)
+
+                success, rvec, tvec = cv2.solvePnP(
+                    obj_pts, corners[idx], self.camera_matrix, self.dist_coeff
+                )
+                if success:
+                    poses[int(marker_id)] = tvec.flatten()
+
+        rgbFrame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        mpImage = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgbFrame)
+        detectionResult = self.landmarker.detect(mpImage)
+
+        gesture = None
+
+        if detectionResult.hand_landmarks:
+            for handLandmarks in detectionResult.hand_landmarks:
+                self.drawLandmarks(frame, handLandmarks)
+                gesture = self.recognize_gesture(handLandmarks)
+                cv2.putText(frame, f"Gesture: {gesture}", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
+
+        self.processGame(poses,gesture)
+
+        cv2.putText(frame, f"Game State: {self.gameState}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
         cv2.imshow("camera", frame)
         cv2.waitKey(1)
 
-    def clickCorners(self, event, x, y, flags, param):
-        if event == cv2.EVENT_LBUTTONDOWN and not self.calibrated:
-            if len(self.pointsClicked) < 5:
-                self.pointsClicked.append((x, y))
-                pointsLength = len(self.pointsClicked)
-                self.get_logger().info(f"clicked {x} {y} for the {pointsLength} point")
 
+    def drawLandmarks(self, frame, handLandmarks):
+        h, w, _ = frame.shape
+        connections = [
+            (0, 1), (1, 2), (2, 3), (3, 4),
+            (0, 5), (5, 6), (6, 7), (7, 8),
+            (9, 10), (10, 11), (11, 12),
+            (13, 14), (14, 15), (15, 16),
+            (0, 17), (17, 18), (18, 19), (19, 20),
+            (5, 9), (9, 13), (13, 17)
+        ]
+        coords = [(int(lm.x * w), int(lm.y * h)) for lm in handLandmarks]
+        for p1, p2 in connections:
+            cv2.line(frame, coords[p1], coords[p2], (0, 255, 0), 2)
+        for x, y in coords:
+            cv2.circle(frame, (x, y), 4, (0, 0, 255), -1)
 
-    def calibrateCoords(self, frame):
-        paper_points = np.array(self.pointsClicked[:4], dtype=np.float32)
-        robot_points = np.array(self.pointsClicked[4], dtype=np.float32)
-
-        paper_size = np.array([[0, 0], 
-        [self.paperWidth, 0], 
-        [self.paperWidth, self.paperHeight], 
-        [0, self.paperHeight]], 
-        dtype=np.float32)
+    def recognize_gesture(self, handLandmarks):
+        fingerTips = [8, 12, 16, 20]
+        fingerMcps = [5, 9, 13, 17]
         
-        H_paper = cv2.getPerspectiveTransform(paper_points, paper_size)
-
-        rx, ry = robot_points
-        robot_local = np.dot(H_paper, np.array([rx, ry, 1.0], dtype=np.float32).T)
-        robotX=float(robot_local[0])
-        robotY=float(robot_local[1])    
+        wrist = handLandmarks[0]
         
-        mappedRobotPoints = paper_size - np.array([[robotX, robotY]], dtype=np.float32)
-        self.H, _ = cv2.findHomography(paper_points, mappedRobotPoints)
+        extendedFingers = 0
+        for tipIdx, mcpIdx in zip(fingerTips, fingerMcps):
+            tip = handLandmarks[tipIdx]
+            mcp = handLandmarks[mcpIdx]
+            
+            
+            distTip = np.hypot(tip.x - wrist.x, tip.y - wrist.y)
+            distMcp = np.hypot(mcp.x - wrist.x, mcp.y - wrist.y)
+            
+            if distTip > distMcp:
+                extendedFingers += 1
 
-        self.calibrated = True
-        self.get_logger().info("calibration complete")
-
-    def processFrame(self, frame):
-        self.frame_count += 1
-        if self.frame_count % self.process_every_n_frames == 0:
-            results = self.model(frame, verbose=False, conf=0.2)[0]
-            self.latest_boxes = results.boxes
-
-        for box in self.latest_boxes:
-            cls_id = int(box.cls[0])
-            conf = float(box.conf[0])
-            label_name = self.model.names[cls_id]
-            self.get_logger().info(f"Detected: {label_name} ({conf:.2f})")
+        if extendedFingers >= 4:
+            return "PALM"
+        elif extendedFingers == 0:
+            return "FIST"
         
+        return "UNKNOWN"
+
+    def processGame(self, poses, gesture):
         
+        baseDetected = self.robotBaseID in poses
+        cupDetected = self.cupID in poses
 
-        cupCenter = None
-        handFlag = False
-        for box in self.latest_boxes:
-            label = self.model.names[int(box.cls[0])]
-            x1, y1, x2, y2 = map(int, box.xyxy[0])
 
-            if "hand" in label.lower():
-                handFlag = True
-                cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 0, 255), 2)
-                cv2.putText(frame, label, (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 0, 255), 2)
-            elif "cup" in label.lower() or "mug" in label.lower() or "bottle" in label.lower():
-                cupCenter = ((x1 + x2) // 2, (y1 + y2) // 2)
-                cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
-                cv2.putText(frame, label, (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 0), 2)
-        self.updateGameState(cupCenter, handFlag)
-        cv2.putText(frame, f"Game State: {self.gameState}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
-
-    def updateGameState(self, cupCenter, handFlag):
         if self.gameState == "Human":
-            if cupCenter is not None:
-                self.cupHistory.append(cupCenter)
+            if gesture == "PALM" and not cupDetected:
+            self.get_logger().info("Game lost. Palm on cup, fist on empty")
+            elif gestute == "FIST" and cupDetected:
+                self.get_logger.info("Good job")
+                #tempo or cooldown, and initiate the robot. it should take the hand out of the frame. But the first check should be the distance between the hand and object close, and after that initiate the cooldown
+                #after that, when the cd is over and the hand is out of frame, robot should pefrorm it's actions
+                self.gameState = "Robot"
+        
+
+        if self.gameState == "Robot":
+            if baseDetected and cupDetected:
+                base = poses[self.robotBaseID]
+                cup = poses[self.cupID]
+                x = float(cup[0] - base[0])
+                y = float(cup[1] - base[1])
+
+                self.cupHistory.append((x, y))
                 if len(self.cupHistory) > self.historyLength:
                     self.cupHistory.pop(0)
+                if self.isCupStable():
+                    self.get_logger().info(f"Cup stable at: x={x:.3f}, y={y:.3f}")
+                    point_msg = Point()
+                    point_msg.x = x
+                    point_msg.y = y
+                    point_msg.z = 0.0
+                    self.robot_pub.publish(point_msg)
+                    #tempo or cd until the human can begin it;s actions
+                    self.gameState = "Human"
                 
-                if not handFlag and self.cupAvailable():
-                    self.gameState = "Robot"
-                    self.get_logger().info("Switching to Robot state")
-
-                    cx,cy = self.cupHistory[-1]
-                    pixels = np.array([[cx, cy, 1.0]], dtype=np.float32).reshape(3,1)
-                    worldCoord = np.dot(self.H, pixels)
-                    robotX = (worldCoord[0] / worldCoord[2])[0]
-                    robotY = (worldCoord[1] / worldCoord[2])[0]
-
-                    msg = Point()
-                    msg.x = robotX
-                    msg.y = robotY
-                    msg.z = 0.0
-                    self.robot_pub.publish(msg)
-
-                    self.get_logger().info(f"Published robot coordinates: x={robotX}, y={robotY}")
-        elif self.gameState == "Robot":
-            if handFlag:
-                self.gameState = "Human"
-                self.get_logger().info("Switching to Human state")
+                
+            else:
                 self.cupHistory.clear()
-                
+            
 
-    def cupAvailable(self):
+    
+    def isCupStable(self):
         if len(self.cupHistory) < self.historyLength:
             return False
         coord = np.array(self.cupHistory)
         std_dev = np.std(coord, axis=0)
-        return float(std_dev[0]) < self.cupThreshold and float(std_dev[1]) < self.cupThreshold
-        
+
+        if float(std_dev[0]) < self.cupThreshold and float(std_dev[1]) < self.cupThreshold:
+            return 1
+        return 0    
 
 def main(args=None):
     rclpy.init(args=args)

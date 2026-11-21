@@ -25,6 +25,7 @@ setup(
     entry_points={
         'console_scripts': [
             'camera_node = camera.camera:main',
+            'camera_setup = camera.camera_calibration:main'
         ],
     },
 )
