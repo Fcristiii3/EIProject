@@ -3,6 +3,8 @@ from rclpy.node import Node
 
 import cv2
 import numpy as np
+import time
+import random
 from cv_bridge import CvBridge
 
 from sensor_msgs.msg import Image
@@ -19,8 +21,10 @@ class CameraNode(Node):
 
         self.robot_pub = self.create_publisher(Point, '/comput_game/camera_coordinates', 10)
 
-        tempo=0 
-        
+        self.tempo = random.uniform(1.0, 3.0)
+        self.cooldownActive = False
+        self.cooldownStartTime = 0.0
+
         try:
             calibData = np.load("camera_calibration.npz")
         except FileNotFoundError:
@@ -29,10 +33,10 @@ class CameraNode(Node):
 
         self.camera_matrix = calibData['camera_matrix']
         self.dist_coeff = calibData['dist_coeff']
-        self.robotBaseID=0
-        self.cupID=1
+        self.robotBaseID = 0
+        self.cupID = 1
 
-        #aruco sizes
+        # ArUco marker configuration
         self.MARKER_SIZE = 0.05
         self.dictionary = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_50)
         self.parameters = cv2.aruco.DetectorParameters()
@@ -49,11 +53,10 @@ class CameraNode(Node):
         )
         self.landmarker = vision.HandLandmarker.create_from_options(options)
 
-        self.cupHistory =[]
+        self.cupHistory = []
         self.historyLength = 5
         self.cupThreshold = 3.0
         self.gameState = "Human"
-
 
         self.cap = cv2.VideoCapture(0, cv2.CAP_V4L2)
         self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
@@ -62,10 +65,9 @@ class CameraNode(Node):
 
         cv2.namedWindow("camera")
 
-        self.timer = self.create_timer(0.05, self.timer_callback)    
+        self.timer = self.create_timer(0.05, self.timer_callback)
 
     def timer_callback(self):
-
         for _ in range(2):
             self.cap.grab()
 
@@ -73,7 +75,7 @@ class CameraNode(Node):
         if not ret:
             self.get_logger().error("no frames captured")
             return
-        
+
         corners, ids, _ = self.detector.detectMarkers(frame)
         poses = {}
         if ids is not None:
@@ -97,19 +99,20 @@ class CameraNode(Node):
         detectionResult = self.landmarker.detect(mpImage)
 
         gesture = None
+        currentHandLandmarks = None
 
         if detectionResult.hand_landmarks:
             for handLandmarks in detectionResult.hand_landmarks:
                 self.drawLandmarks(frame, handLandmarks)
                 gesture = self.recognize_gesture(handLandmarks)
+                currentHandLandmarks = handLandmarks
                 cv2.putText(frame, f"Gesture: {gesture}", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
 
-        self.processGame(poses,gesture)
+        self.processGame(poses, gesture, currentHandLandmarks, corners, frame.shape)
 
         cv2.putText(frame, f"Game State: {self.gameState}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
         cv2.imshow("camera", frame)
         cv2.waitKey(1)
-
 
     def drawLandmarks(self, frame, handLandmarks):
         h, w, _ = frame.shape
@@ -130,18 +133,17 @@ class CameraNode(Node):
     def recognize_gesture(self, handLandmarks):
         fingerTips = [8, 12, 16, 20]
         fingerMcps = [5, 9, 13, 17]
-        
+
         wrist = handLandmarks[0]
-        
+
         extendedFingers = 0
         for tipIdx, mcpIdx in zip(fingerTips, fingerMcps):
             tip = handLandmarks[tipIdx]
             mcp = handLandmarks[mcpIdx]
-            
-            
+
             distTip = np.hypot(tip.x - wrist.x, tip.y - wrist.y)
             distMcp = np.hypot(mcp.x - wrist.x, mcp.y - wrist.y)
-            
+
             if distTip > distMcp:
                 extendedFingers += 1
 
@@ -149,26 +151,55 @@ class CameraNode(Node):
             return "PALM"
         elif extendedFingers == 0:
             return "FIST"
-        
+
         return "UNKNOWN"
 
-    def processGame(self, poses, gesture):
-        
+    def isHandNearObject(self, handLandmarks, markerCorners, frameShape, distanceThreshold=150.0):
+
+        if not handLandmarks or not markerCorners:
+            return False
+
+        h, w, _ = frameShape
+        wrist = handLandmarks[0]
+        wristPx = np.array([wrist.x * w, wrist.y * h], dtype=np.float32)
+
+        for cornerSet in markerCorners:
+            pts = cornerSet[0]
+            markerPx = np.mean(pts, axis=0)
+            dist = np.hypot(wristPx[0] - markerPx[0], wristPx[1] - markerPx[1])
+            if dist <= distanceThreshold:
+                return True
+
+        return False
+
+    def processGame(self, poses, gesture, handLandmarks=None, markerCorners=None, frameShape=(480, 640, 3)):
         baseDetected = self.robotBaseID in poses
         cupDetected = self.cupID in poses
+        handDetected = handLandmarks is not None and len(handLandmarks) > 0
 
+        currentTime = time.time()
 
         if self.gameState == "Human":
-            if gesture == "PALM" and not cupDetected:
-            self.get_logger().info("Game lost. Palm on cup, fist on empty")
-            elif gestute == "FIST" and cupDetected:
-                self.get_logger.info("Good job")
-                #tempo or cooldown, and initiate the robot. it should take the hand out of the frame. But the first check should be the distance between the hand and object close, and after that initiate the cooldown
-                #after that, when the cd is over and the hand is out of frame, robot should pefrorm it's actions
-                self.gameState = "Robot"
-        
+            if not self.cooldownActive:
+                if gesture == "PALM" and cupDetected:
+                    self.get_logger().info("Game lost. Palm on cup, fist on empty.")
+                
+                elif gesture == "PALM" and not cupDetected:
+                    if self.isHandNearObject(handLandmarks, markerCorners, frameShape):
+                        self.get_logger().info("Good job")
+                        
+                        self.cooldownActive = True
+                        self.cooldownStartTime = currentTime
+                        self.tempo = random.uniform(1.0, 3.0)
+                        self.get_logger().info(f"Hand close to target. Cooldown active (Tempo: {self.tempo:.2f}s). Wait for hand removal...")
+            else:
+                elapsed = currentTime - self.cooldownStartTime
+                if not handDetected and elapsed >= self.tempo:
+                    self.get_logger().info("Hand removed and tempo elapsed. Switch to Robot turn.")
+                    self.cooldownActive = False
+                    self.gameState = "Robot"
 
-        if self.gameState == "Robot":
+        elif self.gameState == "Robot":
             if baseDetected and cupDetected:
                 base = poses[self.robotBaseID]
                 cup = poses[self.cupID]
@@ -178,6 +209,7 @@ class CameraNode(Node):
                 self.cupHistory.append((x, y))
                 if len(self.cupHistory) > self.historyLength:
                     self.cupHistory.pop(0)
+
                 if self.isCupStable():
                     self.get_logger().info(f"Cup stable at: x={x:.3f}, y={y:.3f}")
                     point_msg = Point()
@@ -185,15 +217,20 @@ class CameraNode(Node):
                     point_msg.y = y
                     point_msg.z = 0.0
                     self.robot_pub.publish(point_msg)
-                    #tempo or cd until the human can begin it;s actions
-                    self.gameState = "Human"
-                
-                
+
+                    self.cooldownActive = True
+                    self.cooldownStartTime = currentTime
+                    self.gameState = "RobotExecuting"
             else:
                 self.cupHistory.clear()
-            
 
-    
+        elif self.gameState == "RobotExecuting":
+            elapsed = currentTime - self.cooldownStartTime
+            if elapsed >= self.tempo:
+                self.get_logger().info("Robot finished move. Human turn starts!")
+                self.cooldownActive = False
+                self.gameState = "Human"
+
     def isCupStable(self):
         if len(self.cupHistory) < self.historyLength:
             return False
@@ -202,7 +239,7 @@ class CameraNode(Node):
 
         if float(std_dev[0]) < self.cupThreshold and float(std_dev[1]) < self.cupThreshold:
             return 1
-        return 0    
+        return 0
 
 def main(args=None):
     rclpy.init(args=args)
@@ -210,5 +247,6 @@ def main(args=None):
     rclpy.spin(camera_node)
     camera_node.destroy_node()
     rclpy.shutdown()
+
 if __name__ == '__main__':
     main()
