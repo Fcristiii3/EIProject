@@ -1,189 +1,89 @@
 # robot_arm_movement
 
-This ROS 2 Python package controls the simulated or physical robot arm through separate arm and gripper action controllers.
+ROS 2 Humble Python package controlling the OpenMANIPULATOR-X arm and gripper for the `EIProject` camera rhythm game (`"Palm on cup, fist on empty"`).
 
 ## Responsibilities
 
-The node provides:
+- Live URDF discovery via `/robot_state_publisher` (`robot_description` XML), extracting `joint1`–`joint4`, `gripper_left_joint` (excluding `<mimic>` `gripper_right_joint` and fixed joints), link offsets, and physical limits (`[-0.010, 0.019]` m gripper clamp).
+- Live controller & broadcaster verification via `/spawner_joint_state_broadcaster`, `/joint_states`, `/arm_controller/follow_joint_trajectory`, and `/gripper_controller/gripper_cmd`.
+- Analytical 4-DOF OpenMANIPULATOR-X inverse kinematics (`solve_open_manipulator_ik`) and forward kinematics (`forward_kinematics_xyz`) in `robot_arm_movement/kinematics.py` with radial clamping, pitch fallback, and configurable camera frame calibration (`camera_offset_xyz`, `camera_scale_xyz`, `camera_preferred_pitch`).
+- Multi-step rhythm-game motion sequences for `EIProject`'s camera loop:
+  - **`tap`** (`OPEN_GRIPPER = 0.015` m): tap at target and retract to `HOME_POSE` (`done:tap` -> `ready`), leaving the cup visible in the camera FOV.
+  - **`grab`** (`CLOSED_GRIPPER = -0.010` m): approach open -> close on cup & remember table coordinates -> lift vertically -> swing sideways to `grab_hold_pose` (`[1.45, -0.9, 0.2, 0.7, -0.010]`) keeping gripper closed (`done:grab`) so `cupID=1` leaves the camera FOV.
+  - **`place` / `reset` while holding** (or optional `grab_hold_duration_sec > 0`): carry back over remembered table coordinates -> lower -> release (`0.015` m) -> retract to `HOME_POSE` (`done:place` -> `ready`).
+- Tempo scaling via `/comput_game/tempo` and `tempo_scale`, plus game-loop synchronization via `/comput_game/arm_status`.
 
-- arm trajectory control through `/arm_controller/follow_joint_trajectory`;
-- gripper control through `/gripper_controller/gripper_cmd`;
-- home-pose initialization;
-- tempo-scaled trajectory duration;
-- camera-coordinate translation;
-- randomized tap/grab behavior for interactive commands;
-- independent mock execution without live controllers;
-- runtime discovery of live controller joint configuration.
+## Public ROS Interfaces
 
-## Pose representation
+### Subscribed topics
 
-Each command uses one five-value pose:
-
-```text
-[arm_joint_1, arm_joint_2, arm_joint_3, arm_joint_4, gripper_position]
-```
-
-The first four values are sent to the arm controller. The fifth value is sent to the gripper controller. The arm and gripper are separate ROS actions and must not receive the combined five-value list.
-
-## Public interfaces
-
-The node subscribes to:
-
-| Interface | Type | Meaning |
+| Topic | Type | Purpose |
 |---|---|---|
-| `/comput_game/target_action` | `std_msgs/msg/String` | Receives `interact`, `cup`, `box`, `cloth`, `reset`, or `home`. |
-| `/comput_game/camera_coordinates` | `geometry_msgs/msg/Point` | Receives camera coordinates for a translated arm target. |
+| `/comput_game/target_action` | `std_msgs/msg/String` | `interact`, `cup`, `box`, `place`, `cloth`, `reset`, `home`. |
+| `/comput_game/camera_coordinates` | `geometry_msgs/msg/Point` | Cup offset `(x, y, z)` relative to `robotBaseID=0` from `camera_node`. |
+| `/comput_game/tempo` | `std_msgs/msg/Float64` | Dynamically updates `tempo_scale` (clamped `>= 0.1`). |
+| `/joint_states` | `sensor_msgs/msg/JointState` | Live joint names and feedback from `joint_state_broadcaster`. |
 
-The node uses:
+### Published topics
 
-| Action | Purpose |
-|---|---|
-| `/arm_controller/follow_joint_trajectory` | Four-joint arm movement. |
-| `/gripper_controller/gripper_cmd` | Single-joint gripper movement. |
+| Topic | Type | Purpose |
+|---|---|---|
+| `/comput_game/arm_status` | `std_msgs/msg/String` | Publishes `initializing`, `ready`, `busy`, `done:tap`, `done:grab`, `done:place`, `done:reset`, `done:home`, or `error`. |
+| `/comput_game/tempo` | `std_msgs/msg/Float64` | Broadcasts initial and active `tempo_scale`. |
 
-## Command behavior
+### Action clients & service clients
 
-`interact`, `cup`, and `box` select randomly between tap and grab poses. `cloth`, `reset`, and `home` resolve to the home pose. Camera input uses the current fixed translation `[x, y - 0.5, z + 0.2, 0.3]`; its gripper value is selected by the tap/grab choice.
+| Interface | Type | Purpose |
+|---|---|---|
+| `/arm_controller/follow_joint_trajectory` | `control_msgs/action/FollowJointTrajectory` | Four-joint arm trajectory execution (`joint1`–`joint4`). |
+| `/gripper_controller/gripper_cmd` | `control_msgs/action/GripperCommand` | Prismatic gripper execution (`gripper_left_joint` in `[-0.010, 0.019]` m). |
+| `/robot_state_publisher/get_parameters` | `rcl_interfaces/srv/GetParameters` | Fetches `robot_description` URDF XML on live startup. |
 
-The node waits passively for incoming player or camera messages. Explicit player-state synchronization, command queueing, and command cancellation are not currently implemented.
+## Launching (`hardware`, `fake`, `gazebo`, `attach`, `mock`)
 
-## Dependencies
-
-### Runtime package dependencies
-
-The package declares these ROS 2 dependencies in `package.xml`:
-
-- `rclpy`: node, parameter, and action-client APIs;
-- `rcl_interfaces`: live controller parameter discovery;
-- `geometry_msgs`: camera-coordinate messages;
-- `trajectory_msgs`: arm trajectory points;
-- `control_msgs`: arm and gripper action definitions;
-- `std_msgs`: game command messages;
-- `action_msgs`: ROS action status types.
-
-### Live simulation dependencies
-
-The Docker/ROS environment additionally needs `ros2_control`, `controller_manager`, the joint trajectory and gripper controllers, Gazebo ROS integration, and the OpenMANIPULATOR-X bringup/description packages. The OpenMANIPULATOR-X Dynamixel interface packages are needed for hardware-oriented configurations. These are not required for mock mode.
-
-### Test and build dependencies
-
-Tests use `python3-pytest` and the existing ROS 2 `ament` test tools. Building uses `ament_python`, `setuptools`, and `colcon`. Live integration testing additionally requires the simulation dependencies listed above.
-
-## Running
-
-Inside the ROS 2 container:
+Unified launch entry point: `launch/robot_arm_movement.launch.py` (`auto_return_home:=true` by default):
 
 ```bash
-source /opt/ros/humble/setup.bash
-source /ros2_ws/install/setup.bash
-ros2 run robot_arm_movement arm_controller_node --ros-args -p mock_mode_enabled:=true
+# Real hardware + EIProject camera
+ros2 launch robot_arm_movement robot_arm_movement.launch.py \
+  mode:=hardware port_name:=/dev/ttyUSB0 launch_camera:=true
+
+# Headless fake ros2_control stack (uses config/controllers.yaml with use_sim:=false)
+ros2 launch robot_arm_movement robot_arm_movement.launch.py mode:=fake
+
+# Gazebo Classic simulation
+xvfb-run -a ros2 launch robot_arm_movement robot_arm_movement.launch.py mode:=gazebo
+
+# Attach only arm_controller_node to an already-running controller stack
+ros2 launch robot_arm_movement robot_arm_movement.launch.py mode:=attach
+
+# Standalone mock mode (no hardware or ros2_control required)
+ros2 launch robot_arm_movement robot_arm_movement.launch.py mode:=mock
 ```
 
-For live simulation, start the OpenMANIPULATOR-X Gazebo launch first and then run the node with `mock_mode_enabled:=false`. The live node discovers the controller names and waits for both action servers before dispatching its home pose.
+> **Note on `open_manipulator_x_bringup fake.launch.py`:** Upstream `base.launch.py` defaults `use_sim` to `true`, which skips `ros2_control_node` unless `use_sim:=false` is passed and causes `/spawner_joint_state_broadcaster` to hang. `robot_arm_movement.launch.py mode:=fake` launches `robot_state_publisher`, `ros2_control_node` (with SI-unit `config/controllers.yaml`), and controller spawners with `use_sim:=false` directly.
 
-## Deterministic tests
+### Key parameters
 
-The package tests deterministic pose resolution without starting ROS controllers:
+- `mock_mode_enabled` (`bool`, default `true` in standalone node; `false` in `hardware`/`fake`/`gazebo`/`attach` launch)
+- `auto_return_home` (`bool`, default `false` in standalone node; `true` in `robot_arm_movement.launch.py`)
+- `grab_hold_duration_sec` (`double`, default `0.0`; `> 0.0` auto-places cup after hold delay)
+- `grab_hold_pose` (`double[5]`, default `[1.45, -0.9, 0.2, 0.7, -0.010]`)
+- `camera_offset_xyz` (`double[3]`, default `[0.0, 0.0, 0.0]`), `camera_scale_xyz` (`double[3]`, default `[1.0, 1.0, 1.0]`), `camera_preferred_pitch` (`double`, default `0.3`)
+- `camera_action_mode` (`string`, default `"random"`; set `"tap"` or `"grab"` to force deterministic behavior)
+- `tempo_scale` (`double`, default `1.0`), `controller_discovery_timeout_sec` (`double`, default `15.0`)
+
+## Building & Testing
 
 ```bash
-python3 -m pytest -q src/robot_arm_movement/test/test_arm_controller_behavior.py
+# Build inside ROS 2 container
+colcon build --symlink-install --packages-select robot_arm_movement
+
+# Full test & linter suite (unit, discovery, launch, fault injection, mock integration, flake8, pep257)
+colcon test --packages-select robot_arm_movement --event-handlers console_cohesion+
+colcon test-result --test-result-base build/robot_arm_movement --verbose
+
+# Headless fake ros2_control integration suite
+colcon test --packages-select robot_arm_movement --event-handlers console_cohesion+ \
+  --pytest-args -m integration ' --robot-arm-mode=fake' ' --robot-arm-timeout=45'
 ```
-
-These tests cover home/reset mapping, deterministic tap and grab mapping, camera translation, and the four-arm-plus-one-gripper pose split. Random behavior is controlled by the test through deterministic choice injection.
-
-## Integration tests
-
-The reusable integration test is separate from the node implementation and exercises the complete public ROS interface:
-
-```bash
-python3 -m pytest -q -m integration src/robot_arm_movement/test/test_integration.py
-```
-
-By default it starts the node in mock mode and tests `interact`, `cup`, `box`, `cloth`, `reset`, `home`, and camera coordinates. It verifies that every command produces arm and gripper results, that results report success, and that no joint-mismatch error appears. It also verifies that `reset` and `home` retain distinct command labels while currently dispatching the same home targets.
-
-Select the mode directly through pytest:
-
-```bash
-python3 -m pytest -q -m integration src/robot_arm_movement/test/test_integration.py --robot-arm-mode=mock
-python3 -m pytest -q -m integration src/robot_arm_movement/test/test_integration.py --robot-arm-mode=live
-```
-
-The default startup and per-command timeout is 30 seconds. This allows for ROS graph discovery, executor scheduling, log flushing, and Gazebo controller response while still detecting a stuck test. Override it when the host is under load or startup is slow:
-
-```bash
-python3 -m pytest -q -m integration src/robot_arm_movement/test/test_integration.py --robot-arm-mode=live --robot-arm-timeout=60
-```
-
-Run the same test against a running live simulation with:
-
-```bash
-python3 -m pytest -q -m integration src/robot_arm_movement/test/test_integration.py --robot-arm-mode=live
-```
-
-For live mode, start Gazebo and activate both controllers before running pytest. The test requires the `ros2` CLI, the installed `robot_arm_movement` package, `rclpy`, active arm and gripper action servers, and the OpenMANIPULATOR-X simulation stack. Mock mode requires only the ROS 2 runtime and installed package. No environment variable is required.
-
-The node's live controller-discovery timeout defaults to 15 seconds. Override it when starting the node if the simulation or hardware stack needs longer:
-
-```bash
-ros2 run robot_arm_movement arm_controller_node --ros-args \
-  -p mock_mode_enabled:=false \
-  -p controller_discovery_timeout_sec:=30.0
-```
-
-Start the live OpenMANIPULATOR-X simulation with the exact command used by this project:
-
-```bash
-xvfb-run -a ros2 launch open_manipulator_x_bringup gazebo.launch.py
-```
-
-Then verify the controllers in another terminal:
-
-```bash
-source /opt/ros/humble/setup.bash
-source /ros2_ws/install/setup.bash
-ros2 control list_controllers
-ros2 param get /arm_controller joints
-ros2 param get /gripper_controller joint
-```
-
-The integration test is intentionally sequential: it waits for each command to appear in the node log before publishing the next command. This prevents asynchronous command overlap and makes command/result attribution meaningful. The interactive commands are randomized, so the test checks valid completion and controller separation rather than one fixed tap/grab outcome. The test is not a substitute for hardware safety validation.
-
-## Negative and fault-injection tests
-
-Run the deterministic failure-path tests with:
-
-```bash
-python3 -m pytest -q -m fault_injection src/robot_arm_movement/test/test_failure_paths.py
-```
-
-These tests exercise controller goal rejection, unsuccessful arm results, unsuccessful gripper results, and failed initialization. They verify that failures are logged and that the node does not falsely report initialization readiness. They use fake results and do not require Gazebo or hardware.
-
-Live-mode discovery and action failure branches are covered with deterministic controller doubles:
-
-```bash
-python3 -m pytest -q -m fault_injection src/robot_arm_movement/test/test_live_failures.py
-```
-
-These cases cover unavailable action servers, unavailable parameter services, discovery timeout, invalid discovered joints, rejected goals, and unsuccessful arm/gripper results. They are deliberately not run against a real controller because real hardware and Gazebo do not provide deterministic failure injection. The positive live test remains necessary for real action-server and controller compatibility.
-
-The positive integration tests verify the real ROS topic path. The fault-injection tests verify callback behavior deterministically. A future full ROS fault-injection suite may add fake action servers and parameter services to test discovery timeout, missing controller parameters, action rejection over the ROS graph, and partial initialization. A live Gazebo run is not a reliable way to generate those failures on demand.
-
-## Known limitations
-
-- Home initialization establishes a known home pose but does not measure or calibrate the full workspace.
-- Camera translation uses fixed offsets and does not yet perform frame calibration, scaling, or workspace-bound validation.
-- The current node passively waits for player messages rather than maintaining an explicit player-action state machine.
-
-## Official references
-
-- [ROS 2 Humble documentation](https://docs.ros.org/en/humble/)
-- [ROS 2 Humble installation](https://docs.ros.org/en/humble/Installation.html)
-- [ros2_control Humble documentation](https://control.ros.org/humble/)
-- [ros2_control getting started](https://control.ros.org/humble/doc/getting_started/getting_started.html)
-- [Gazebo ROS 2 integration](https://classic.gazebosim.org/tutorials?tut=ros2_overview)
-- [OpenMANIPULATOR-X ROS 2 simulation guide](https://emanual.robotis.com/docs/en/platform/openmanipulator_x/ros_simulation/)
-- [OpenMANIPULATOR-X quick-start guide](https://emanual.robotis.com/docs/en/platform/openmanipulator_x/quick_start_guide/)
-- [pytest documentation](https://docs.pytest.org/en/stable/)
-
-The exact launch command above is project-specific but follows the official OpenMANIPULATOR-X simulation guide. This project currently uses Gazebo Classic packages in its ROS 2 Humble container; newer Gazebo distributions use different integration packages and launch conventions.
-- Interactive command selection is intentionally random and therefore requires invariant-based integration assertions.
