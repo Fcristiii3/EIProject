@@ -37,8 +37,8 @@ class CameraNode(Node):
         self.cupID = 1
 
         # ArUco marker configuration
-        self.MARKER_SIZE = 0.05
-        self.dictionary = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_50)
+        self.MARKER_SIZE = 0.06
+        self.dictionary = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_6X6_250)
         self.parameters = cv2.aruco.DetectorParameters()
         self.detector = cv2.aruco.ArucoDetector(self.dictionary, self.parameters)
 
@@ -154,7 +154,7 @@ class CameraNode(Node):
 
         return "UNKNOWN"
 
-    def isHandNearObject(self, handLandmarks, markerCorners, frameShape, distanceThreshold=150.0):
+    def isHandNearObject(self, handLandmarks, markerCorners, frameShape, distanceThreshold=170.0):
 
         if not handLandmarks or not markerCorners:
             return False
@@ -181,17 +181,20 @@ class CameraNode(Node):
 
         if self.gameState == "Human":
             if not self.cooldownActive:
-                if gesture == "PALM" and cupDetected:
-                    self.get_logger().info("Game lost. Palm on cup, fist on empty.")
-                
-                elif gesture == "PALM" and not cupDetected:
+                if gesture == "PALM" and baseDetected:
                     if self.isHandNearObject(handLandmarks, markerCorners, frameShape):
-                        self.get_logger().info("Good job")
-                        
+                        self.get_logger().info("Good job - PALM near target detected.")
                         self.cooldownActive = True
                         self.cooldownStartTime = currentTime
                         self.tempo = random.uniform(1.0, 3.0)
                         self.get_logger().info(f"Hand close to target. Cooldown active (Tempo: {self.tempo:.2f}s). Wait for hand removal...")
+                elif gesture == "FIST" and not cupDetected and baseDetected:
+                    self.get_logger().info("Good job x2 - FIST gesture detected.")
+                    self.cooldownActive = True
+                    self.cooldownStartTime = currentTime
+                    self.tempo = random.uniform(1.0, 3.0)
+                    self.get_logger().info(f"Hand close to target. Cooldown active (Tempo: {self.tempo:.2f}s). Wait for hand removal...")
+
             else:
                 elapsed = currentTime - self.cooldownStartTime
                 if not handDetected and elapsed >= self.tempo:
@@ -221,15 +224,38 @@ class CameraNode(Node):
                     self.cooldownActive = True
                     self.cooldownStartTime = currentTime
                     self.gameState = "RobotExecuting"
-            else:
-                self.cupHistory.clear()
+
+            elif baseDetected and not cupDetected:
+                if len(self.cupHistory) > 0:
+                    avgCoords = np.mean(self.cupHistory, axis=0)
+                    x = float(avgCoords[0])
+                    y = float(avgCoords[1])
+
+                    pointMsg = Point()
+                    pointMsg.x = x
+                    pointMsg.y = y
+                    pointMsg.z = 0.0
+                    self.robot_pub.publish(pointMsg)
+
+                    self.get_logger().info(f"Cup missing - Publishing fallback average: x={x:.3f}, y={y:.3f}")
+
+                    self.cooldownActive = True
+                    self.cooldownStartTime = currentTime
+                    self.gameState = "RobotExecuting"
+                else:
+                    self.get_logger().warn("Robot turn active, but cup missing and no history recorded yet. Waiting for marker...")
+
+            elif not baseDetected:
+                self.get_logger().warn("Robot base marker ID 0 not detected in frame.")
 
         elif self.gameState == "RobotExecuting":
             elapsed = currentTime - self.cooldownStartTime
             if elapsed >= self.tempo:
-                self.get_logger().info("Robot finished move. Human turn starts!")
+                self.get_logger().info("Robot finished move. Resetting history and starting Human turn!")
+                self.cupHistory.clear() 
                 self.cooldownActive = False
                 self.gameState = "Human"
+
 
     def isCupStable(self):
         if len(self.cupHistory) < self.historyLength:
