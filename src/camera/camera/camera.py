@@ -230,7 +230,7 @@ class CameraNode(Node):
                 point_msg = Point()
                 point_msg.x = float(x)
                 point_msg.y = float(y)
-                point_msg.z = 0.0
+                point_msg.z = 0.02
 
                 self.get_logger().info(f"Publishing {x} and {y}")
                 self.robot_pub.publish(point_msg)
@@ -247,7 +247,7 @@ class CameraNode(Node):
                 point_msg = Point()
                 point_msg.x = float(x)
                 point_msg.y = float(y)
-                point_msg.z = 0.0
+                point_msg.z = 0.1
 
                 self.get_logger().info(f"Publishing {x} and {y}")
                 self.robot_pub.publish(point_msg)
@@ -276,4 +276,11 @@ class CameraNode(Node):
         return float(std_dev[0]) < self.cupThreshold and float(std_dev[1]) < self.cupThreshold
 
 def main(args=None):
-    rclpy
+    rclpy.init(args=args)
+    camera_node = CameraNode()
+    rclpy.spin(camera_node)
+    camera_node.destroy_node()
+    rclpy.shutdown()
+
+if __name__ == '__main__':
+    main()
