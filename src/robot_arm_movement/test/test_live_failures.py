@@ -2,8 +2,7 @@
 
 from collections import namedtuple
 import pytest
-from robot_arm_movement.arm_controller_node import ComputRhythmArmController
-from robot_arm_movement.discovery import discover_live_runtime
+from robot_arm_movement.arm_controller_node import OPEN_GRIPPER, ComputRhythmArmController, discover_live_runtime
 
 VALID_URDF = """<robot name="omx">
   <link name="l1"/><joint name="joint1" type="revolute"><parent link="l1"/><child link="l2"/><limit lower="-3.14" upper="3.14"/></joint>
@@ -37,9 +36,7 @@ class Client:
     __slots__ = ("available", "service", "future")
 
     def __init__(self, available=True, service=True, future=None):
-        self.available = available
-        self.service = service
-        self.future = future
+        self.available, self.service, self.future = available, service, future
 
     def wait_for_server(self, timeout_sec):
         return self.available
@@ -92,20 +89,11 @@ class Controller:
     __slots__ = ("_arm_action_client", "_gripper_action_client", "create_client", "get_parameter", "logger", "pose_split_arm_gripper", "runtime_ready", "spec", "arm_joint_names", "gripper_joint_name", "joint_states_received", "latest_joint_names", "node_names", "statuses")
 
     def __init__(self):
-        self.logger = Logger()
-        self.get_parameter = lambda _name=None: LiveParameter()
+        self.logger, self.get_parameter = Logger(), lambda _name=None: LiveParameter()
         self.create_client = lambda service, name: Client(future=ActionFuture(DiscoveredResponse(values=[StringValue(string_value=VALID_URDF)])))
-        self.pose_split_arm_gripper = 4
-        self.runtime_ready = False
-        self.spec = None
-        self.arm_joint_names = None
-        self.gripper_joint_name = None
-        self.joint_states_received = True
-        self.latest_joint_names = ["joint1", "joint2", "joint3", "joint4", "gripper_left_joint"]
-        self.node_names = []
-        self.statuses = []
-        self._arm_action_client = Client()
-        self._gripper_action_client = Client()
+        self.pose_split_arm_gripper, self.runtime_ready, self.spec, self.arm_joint_names, self.gripper_joint_name = 4, False, None, None, None
+        self.joint_states_received, self.latest_joint_names = True, ["joint1", "joint2", "joint3", "joint4", "gripper_left_joint"]
+        self.node_names, self.statuses, self._arm_action_client, self._gripper_action_client = [], [], Client(), Client()
 
     def get_logger(self):
         return self.logger
@@ -135,7 +123,7 @@ def test_missing_robot_state_publisher_does_not_enable_runtime():
 @pytest.mark.fault_injection
 def test_robot_state_publisher_timeout_does_not_enable_runtime(monkeypatch):
     controller = node(create_client=lambda service, name: Client(future=ActionFuture(None)))
-    monkeypatch.setattr("robot_arm_movement.discovery.rclpy.spin_until_future_complete", lambda *args, **kwargs: None)
+    monkeypatch.setattr("robot_arm_movement.arm_controller_node.rclpy.spin_until_future_complete", lambda *args, **kwargs: None)
     ComputRhythmArmController._discover_runtime(controller)
     assert controller.runtime_ready is False
     assert any("timed out" in msg for msg in controller.logger.messages)
@@ -145,7 +133,7 @@ def test_robot_state_publisher_timeout_does_not_enable_runtime(monkeypatch):
 @pytest.mark.parametrize("bad_urdf", ["", "<robot><joint name='joint1' type='revolute'><parent link='a'/><child link='b'/></joint></robot>"])
 def test_invalid_urdf_does_not_enable_runtime(monkeypatch, bad_urdf):
     controller = node(create_client=lambda service, name: Client(future=ActionFuture(DiscoveredResponse(values=[StringValue(string_value=bad_urdf)]))))
-    monkeypatch.setattr("robot_arm_movement.discovery.rclpy.spin_until_future_complete", lambda *args, **kwargs: None)
+    monkeypatch.setattr("robot_arm_movement.arm_controller_node.rclpy.spin_until_future_complete", lambda *args, **kwargs: None)
     ComputRhythmArmController._discover_runtime(controller)
     assert controller.runtime_ready is False
     assert any("Invalid robot_description" in msg for msg in controller.logger.messages)
@@ -154,7 +142,7 @@ def test_invalid_urdf_does_not_enable_runtime(monkeypatch, bad_urdf):
 @pytest.mark.fault_injection
 def test_stuck_spawner_reports_missing_controller_manager(monkeypatch):
     controller = node(_arm_action_client=Client(available=False), node_names=["/robot_state_publisher", "/spawner_joint_state_broadcaster"])
-    monkeypatch.setattr("robot_arm_movement.discovery.rclpy.spin_until_future_complete", lambda *args, **kwargs: None)
+    monkeypatch.setattr("robot_arm_movement.arm_controller_node.rclpy.spin_until_future_complete", lambda *args, **kwargs: None)
     runtime, err = discover_live_runtime(controller, controller._arm_action_client, controller._gripper_action_client, timeout_sec=0.05)
     assert runtime is None
     assert "Action server availability" in err
@@ -164,8 +152,8 @@ def test_stuck_spawner_reports_missing_controller_manager(monkeypatch):
 @pytest.mark.fault_injection
 def test_missing_joint_states_timeout_fails_discovery(monkeypatch):
     controller = node(joint_states_received=False, latest_joint_names=[])
-    monkeypatch.setattr("robot_arm_movement.discovery.rclpy.spin_until_future_complete", lambda *args, **kwargs: None)
-    monkeypatch.setattr("robot_arm_movement.discovery.rclpy.spin_once", lambda *args, **kwargs: None)
+    monkeypatch.setattr("robot_arm_movement.arm_controller_node.rclpy.spin_until_future_complete", lambda *args, **kwargs: None)
+    monkeypatch.setattr("robot_arm_movement.arm_controller_node.rclpy.spin_once", lambda *args, **kwargs: None)
     runtime, err = discover_live_runtime(controller, controller._arm_action_client, controller._gripper_action_client, timeout_sec=0.05)
     assert runtime is None
     assert "Timed out waiting for /joint_states" in err
@@ -174,7 +162,7 @@ def test_missing_joint_states_timeout_fails_discovery(monkeypatch):
 @pytest.mark.fault_injection
 def test_joint_states_mismatch_fails_discovery(monkeypatch):
     controller = node(joint_states_received=True, latest_joint_names=["joint1", "joint2", "joint3", "joint4"])
-    monkeypatch.setattr("robot_arm_movement.discovery.rclpy.spin_until_future_complete", lambda *args, **kwargs: None)
+    monkeypatch.setattr("robot_arm_movement.arm_controller_node.rclpy.spin_until_future_complete", lambda *args, **kwargs: None)
     ComputRhythmArmController._discover_runtime(controller)
     assert controller.runtime_ready is False
     assert any("Joint mismatch" in msg and "gripper_left_joint" in msg for msg in controller.logger.messages)
@@ -184,7 +172,7 @@ def test_joint_states_mismatch_fails_discovery(monkeypatch):
 def test_rejected_live_goal_is_reported():
     controller = node()
     future = ActionFuture(GoalHandle(accepted=False))
-    ComputRhythmArmController.goal_response_callback(controller, future, "gripper", "cup", 0.015)
+    ComputRhythmArmController.goal_response_callback(controller, future, "gripper", "cup", OPEN_GRIPPER)
     assert any("Command rejected: name=cup, controller=gripper" in message for message in controller.logger.messages)
 
 
@@ -193,5 +181,5 @@ def test_rejected_live_goal_is_reported():
 def test_unsuccessful_live_result_is_reported(controller_name, result, expected):
     controller = node()
     future = ActionFuture(ResultResponse(result=result))
-    ComputRhythmArmController.get_result_callback(controller, future, controller_name, "home", [0.0, -1.0, 0.0, 1.0] if controller_name == "arm" else 0.015)
+    ComputRhythmArmController.get_result_callback(controller, future, controller_name, "home", [0.0, -1.0, 0.0, 1.0] if controller_name == "arm" else OPEN_GRIPPER)
     assert any(expected in message for message in controller.logger.messages)
