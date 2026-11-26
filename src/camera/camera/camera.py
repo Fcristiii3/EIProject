@@ -28,7 +28,7 @@ class CameraNode(Node):
         try:
             calibData = np.load("camera_calibration.npz")
         except FileNotFoundError:
-            self.get_logger().error("Camera calibration file not found")
+            self.get_logger().error("Camera calibration file not found ('camera_calibration.npz')")
             return
 
         self.camera_matrix = calibData['camera_matrix']
@@ -55,7 +55,10 @@ class CameraNode(Node):
 
         self.cupHistory = []
         self.historyLength = 5
-        self.cupThreshold = 3.0
+        self.cupThreshold = 0.015  # 1.5 cm stability threshold (in meters)
+        self.MAX_ARM_REACH = 0.35  # OpenMANIPULATOR-X max reach limit in meters
+        self.lastCupPixelPos = None
+
         self.gameState = "Human"
 
         self.cap = cv2.VideoCapture(0, cv2.CAP_V4L2)
@@ -64,7 +67,6 @@ class CameraNode(Node):
         self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
 
         cv2.namedWindow("camera")
-
         self.timer = self.create_timer(0.05, self.timer_callback)
 
     def timer_callback(self):
@@ -73,14 +75,17 @@ class CameraNode(Node):
 
         ret, frame = self.cap.read()
         if not ret:
-            self.get_logger().error("no frames captured")
+            self.get_logger().error("No frames captured from camera.")
             return
 
         corners, ids, _ = self.detector.detectMarkers(frame)
         poses = {}
+        marker_corners_map = {}
+
         if ids is not None:
             cv2.aruco.drawDetectedMarkers(frame, corners, ids)
             for idx, marker_id in enumerate(ids.flatten()):
+                marker_id_int = int(marker_id)
                 obj_pts = np.array([
                     [-self.MARKER_SIZE/2,  self.MARKER_SIZE/2, 0],
                     [ self.MARKER_SIZE/2,  self.MARKER_SIZE/2, 0],
@@ -92,7 +97,22 @@ class CameraNode(Node):
                     obj_pts, corners[idx], self.camera_matrix, self.dist_coeff
                 )
                 if success:
-                    poses[int(marker_id)] = tvec.flatten()
+                    poses[marker_id_int] = tvec.flatten()
+                    marker_corners_map[marker_id_int] = corners[idx]
+
+        # Continuously record cup relative pose and last known pixel coordinates
+        if self.robotBaseID in poses and self.cupID in poses:
+            base = poses[self.robotBaseID]
+            cup = poses[self.cupID]
+            rel_x = float(cup[0] - base[0])
+            rel_y = float(cup[1] - base[1])
+
+            self.cupHistory.append((rel_x, rel_y))
+            if len(self.cupHistory) > self.historyLength:
+                self.cupHistory.pop(0)
+
+            pts = marker_corners_map[self.cupID][0]
+            self.lastCupPixelPos = np.mean(pts, axis=0)
 
         rgbFrame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         mpImage = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgbFrame)
@@ -108,7 +128,7 @@ class CameraNode(Node):
                 currentHandLandmarks = handLandmarks
                 cv2.putText(frame, f"Gesture: {gesture}", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
 
-        self.processGame(poses, gesture, currentHandLandmarks, corners, frame.shape)
+        self.processGame(poses, gesture, currentHandLandmarks, marker_corners_map, frame.shape)
 
         cv2.putText(frame, f"Game State: {self.gameState}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
         cv2.imshow("camera", frame)
@@ -133,7 +153,6 @@ class CameraNode(Node):
     def recognize_gesture(self, handLandmarks):
         fingerTips = [8, 12, 16, 20]
         fingerMcps = [5, 9, 13, 17]
-
         wrist = handLandmarks[0]
 
         extendedFingers = 0
@@ -149,123 +168,114 @@ class CameraNode(Node):
 
         if extendedFingers >= 4:
             return "PALM"
-        elif extendedFingers == 0:
+        elif extendedFingers <= 1:
             return "FIST"
 
         return "UNKNOWN"
 
-    def isHandNearObject(self, handLandmarks, markerCorners, frameShape, distanceThreshold=170.0):
-
-        if not handLandmarks or not markerCorners:
+    def isHandNearCup(self, handLandmarks, marker_corners_map, frameShape, distanceThreshold=170.0):
+        if not handLandmarks:
             return False
 
         h, w, _ = frameShape
         wrist = handLandmarks[0]
         wristPx = np.array([wrist.x * w, wrist.y * h], dtype=np.float32)
 
-        for cornerSet in markerCorners:
-            pts = cornerSet[0]
-            markerPx = np.mean(pts, axis=0)
-            dist = np.hypot(wristPx[0] - markerPx[0], wristPx[1] - markerPx[1])
-            if dist <= distanceThreshold:
-                return True
+        if self.cupID in marker_corners_map:
+            pts = marker_corners_map[self.cupID][0]
+            targetPx = np.mean(pts, axis=0)
+            dist = np.hypot(wristPx[0] - targetPx[0], wristPx[1] - targetPx[1])
+            return dist <= distanceThreshold
+
+        if self.lastCupPixelPos is not None:
+            dist = np.hypot(wristPx[0] - self.lastCupPixelPos[0], wristPx[1] - self.lastCupPixelPos[1])
+            return dist <= distanceThreshold
 
         return False
 
-    def processGame(self, poses, gesture, handLandmarks=None, markerCorners=None, frameShape=(480, 640, 3)):
+    def publishCoordinates(self, x, y):
+        # Reachability check: Clamp target if beyond physical arm workspace radius
+        distance = np.hypot(x, y)
+        if distance > self.MAX_ARM_REACH:
+            self.get_logger().warn(
+                f"Target coordinates ({x:.3f}, {y:.3f}) exceed max reach ({distance:.3f}m > {self.MAX_ARM_REACH}m). Clamping vector."
+            )
+            scale = self.MAX_ARM_REACH / distance
+            x *= scale
+            y *= scale
+
+        point_msg = Point()
+        point_msg.x = float(x)
+        point_msg.y = float(y)
+        point_msg.z = 0.0
+
+        self.get_logger().info(f"Publishing target coordinates -> x={x:.3f}m, y={y:.3f}m")
+        self.robot_pub.publish(point_msg)
+
+    def processGame(self, poses, gesture, handLandmarks=None, marker_corners_map=None, frameShape=(480, 640, 3)):
         baseDetected = self.robotBaseID in poses
         cupDetected = self.cupID in poses
         handDetected = handLandmarks is not None and len(handLandmarks) > 0
-
         currentTime = time.time()
 
         if self.gameState == "Human":
             if not self.cooldownActive:
                 if gesture == "PALM" and baseDetected:
-                    if self.isHandNearObject(handLandmarks, markerCorners, frameShape):
-                        self.get_logger().info("Good job - PALM near target detected.")
+                    if self.isHandNearCup(handLandmarks, marker_corners_map, frameShape):
+                        self.get_logger().info("PALM gesture near cup detected.")
                         self.cooldownActive = True
                         self.cooldownStartTime = currentTime
                         self.tempo = random.uniform(1.0, 3.0)
-                        self.get_logger().info(f"Hand close to target. Cooldown active (Tempo: {self.tempo:.2f}s). Wait for hand removal...")
-                elif gesture == "FIST" and not cupDetected and baseDetected:
-                    self.get_logger().info("Good job x2 - FIST gesture detected.")
-                    self.cooldownActive = True
-                    self.cooldownStartTime = currentTime
-                    self.tempo = random.uniform(1.0, 3.0)
-                    self.get_logger().info(f"Hand close to target. Cooldown active (Tempo: {self.tempo:.2f}s). Wait for hand removal...")
+                        self.get_logger().info(f"Cooldown active ({self.tempo:.2f}s). Awaiting hand removal...")
+
+                elif gesture == "FIST" and baseDetected:
+                    if self.isHandNearCup(handLandmarks, marker_corners_map, frameShape):
+                        self.get_logger().info("FIST gesture near cup detected.")
+                        self.cooldownActive = True
+                        self.cooldownStartTime = currentTime
+                        self.tempo = random.uniform(1.0, 3.0)
+                        self.get_logger().info(f"Cooldown active ({self.tempo:.2f}s). Awaiting hand removal...")
 
             else:
                 elapsed = currentTime - self.cooldownStartTime
                 if not handDetected and elapsed >= self.tempo:
-                    self.get_logger().info("Hand removed and tempo elapsed. Switch to Robot turn.")
+                    self.get_logger().info("Hand removed and tempo elapsed. Transitioning to Robot turn.")
                     self.cooldownActive = False
                     self.gameState = "Robot"
 
         elif self.gameState == "Robot":
-            if baseDetected and cupDetected:
-                base = poses[self.robotBaseID]
-                cup = poses[self.cupID]
-                x = float(cup[0] - base[0])
-                y = float(cup[1] - base[1])
+            if baseDetected and cupDetected and self.isCupStable():
+                x, y = self.cupHistory[-1]
+                self.publishCoordinates(x, y)
+                self.cooldownActive = True
+                self.cooldownStartTime = currentTime
+                self.gameState = "RobotExecuting"
 
-                self.cupHistory.append((x, y))
-                if len(self.cupHistory) > self.historyLength:
-                    self.cupHistory.pop(0)
-
-                if self.isCupStable():
-                    self.get_logger().info(f"Cup stable at: x={x:.3f}, y={y:.3f}")
-                    point_msg = Point()
-                    point_msg.x = x
-                    point_msg.y = y
-                    point_msg.z = 0.0
-                    self.robot_pub.publish(point_msg)
-
-                    self.cooldownActive = True
-                    self.cooldownStartTime = currentTime
-                    self.gameState = "RobotExecuting"
-
-            elif baseDetected and not cupDetected:
-                if len(self.cupHistory) > 0:
-                    avgCoords = np.mean(self.cupHistory, axis=0)
-                    x = float(avgCoords[0])
-                    y = float(avgCoords[1])
-
-                    pointMsg = Point()
-                    pointMsg.x = x
-                    pointMsg.y = y
-                    pointMsg.z = 0.0
-                    self.robot_pub.publish(pointMsg)
-
-                    self.get_logger().info(f"Cup missing - Publishing fallback average: x={x:.3f}, y={y:.3f}")
-
-                    self.cooldownActive = True
-                    self.cooldownStartTime = currentTime
-                    self.gameState = "RobotExecuting"
-                else:
-                    self.get_logger().warn("Robot turn active, but cup missing and no history recorded yet. Waiting for marker...")
+            elif baseDetected and len(self.cupHistory) > 0:
+                avgCoords = np.mean(self.cupHistory, axis=0)
+                self.publishCoordinates(avgCoords[0], avgCoords[1])
+                self.cooldownActive = True
+                self.cooldownStartTime = currentTime
+                self.gameState = "RobotExecuting"
 
             elif not baseDetected:
-                self.get_logger().warn("Robot base marker ID 0 not detected in frame.")
+                self.get_logger().warn("Base marker (ID 0) missing. Cannot evaluate robot-relative pose.")
+            else:
+                self.get_logger().warn("Robot turn active, but no valid cup position or history available.")
 
         elif self.gameState == "RobotExecuting":
             elapsed = currentTime - self.cooldownStartTime
             if elapsed >= self.tempo:
-                self.get_logger().info("Robot finished move. Resetting history and starting Human turn!")
-                self.cupHistory.clear() 
+                self.get_logger().info("Robot move duration complete. Human turn starts!")
                 self.cooldownActive = False
                 self.gameState = "Human"
-
 
     def isCupStable(self):
         if len(self.cupHistory) < self.historyLength:
             return False
         coord = np.array(self.cupHistory)
         std_dev = np.std(coord, axis=0)
-
-        if float(std_dev[0]) < self.cupThreshold and float(std_dev[1]) < self.cupThreshold:
-            return 1
-        return 0
+        return float(std_dev[0]) < self.cupThreshold and float(std_dev[1]) < self.cupThreshold
 
 def main(args=None):
     rclpy.init(args=args)
