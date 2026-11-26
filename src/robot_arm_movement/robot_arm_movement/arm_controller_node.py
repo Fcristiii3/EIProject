@@ -15,12 +15,12 @@ from sensor_msgs.msg import JointState
 from std_msgs.msg import Float64, String
 from trajectory_msgs.msg import JointTrajectoryPoint
 
-GRIPPER_MIN_RAD, GRIPPER_MAX_RAD = math.radians(300.0), math.radians(360.0)
-CLOSED_GRIPPER, OPEN_GRIPPER = GRIPPER_MIN_RAD, GRIPPER_MAX_RAD
+GRIPPER_MIN_RAD, GRIPPER_MAX_RAD = -0.027,-0.045
+CLOSED_GRIPPER, OPEN_GRIPPER =   GRIPPER_MIN_RAD, GRIPPER_MAX_RAD
 HOME_POSE = [0.0, -1.0, 0.0, 1.0, OPEN_GRIPPER]
-TAP_POSE = [0.1, -0.4, 0.2, 0.3, OPEN_GRIPPER]
-GRAB_POSE = [0.1, -0.4, 0.2, 0.3, CLOSED_GRIPPER]
-GRAB_HOLD_POSE = [1.45, -0.9, 0.2, 0.7, CLOSED_GRIPPER]
+TAP_POSE = [0.0, -1.0, 0.0, 1.0, CLOSED_GRIPPER]
+GRAB_POSE = [0.0, -1.0, 0.0, 1.0, OPEN_GRIPPER]
+GRAB_HOLD_POSE = [0.0, -1.0, 0.0, 1.0, CLOSED_GRIPPER]
 
 
 @dataclass(frozen=True)
@@ -91,7 +91,7 @@ def forward_kinematics_xyz(arm_joints: Sequence[float], spec: RobotKinematicsSpe
     return (x1 + r * math.cos(q1) - y2 * math.sin(q1), y1 + r * math.sin(q1) + y2 * math.cos(q1), z)
 
 
-def solve_open_manipulator_ik(x: float, y: float, z: float, spec: RobotKinematicsSpec = DEFAULT_SPEC, preferred_pitch: float = 0.3, camera_offset_xyz: Sequence[float] = (0.0, 0.0, 0.0), camera_scale_xyz: Sequence[float] = (1.0, 1.0, 1.0)) -> List[float]:
+def solve_open_manipulator_ik(x: float, y: float, z: float, spec: RobotKinematicsSpec = DEFAULT_SPEC, preferred_pitch: float = 0.3, camera_offset_xyz: Sequence[float] = (0.0, 0.0, 0.0), camera_scale_xyz: Sequence[float] = (1.0, -1.0, 1.0)) -> List[float]:
     """Solve analytical 4-DOF OpenMANIPULATOR-X IK with radial clamping and pitch fallback."""
     tx = float(x) * float(camera_scale_xyz[0]) + float(camera_offset_xyz[0])
     ty = float(y) * float(camera_scale_xyz[1]) + float(camera_offset_xyz[1])
@@ -272,9 +272,9 @@ class ComputRhythmArmController(Node):
         self.joint_state_sub = self.create_subscription(JointState, "/joint_states", self.joint_state_callback, 10)
         self.status_pub = self.create_publisher(String, "/comput_game/arm_status", 10)
         self.tempo_pub = self.create_publisher(Float64, "/comput_game/tempo", 10)
-        self.declare_parameter("tempo_scale", 1.0); self.declare_parameter("mock_mode_enabled", True); self.declare_parameter("mock_execution_delay", 0.3)
-        self.declare_parameter("controller_discovery_timeout_sec", 15.0); self.declare_parameter("auto_return_home", False); self.declare_parameter("grab_hold_duration_sec", 0.0)
-        self.declare_parameter("grab_hold_pose", list(GRAB_HOLD_POSE)); self.declare_parameter("camera_offset_xyz", [0.0, 0.0, 0.0]); self.declare_parameter("camera_scale_xyz", [1.0, 1.0, 1.0])
+        self.declare_parameter("tempo_scale", 1.0); self.declare_parameter("mock_mode_enabled", False); self.declare_parameter("mock_execution_delay", 0.3)
+        self.declare_parameter("controller_discovery_timeout_sec", 15.0); self.declare_parameter("auto_return_home", True); self.declare_parameter("grab_hold_duration_sec", 0.0)
+        self.declare_parameter("grab_hold_pose", list(GRAB_HOLD_POSE)); self.declare_parameter("camera_offset_xyz", [0.0, 0.0, 0.0]); self.declare_parameter("camera_scale_xyz", [1.0, -1.0, 1.0])
         self.declare_parameter("camera_preferred_pitch", 0.3); self.declare_parameter("camera_action_mode", "random")
         self.spec, self.arm_joint_names, self.gripper_joint_name = DEFAULT_SPEC, None, None
         self.runtime_ready, self.joint_states_received, self.latest_joint_names, self.latest_joint_positions = False, False, [], {}
@@ -337,11 +337,15 @@ class ComputRhythmArmController(Node):
 
     def _initialization_goal_done_callback(self, future):
         if future is not None and hasattr(future, "error_code") and future.error_code != 0:
-            self.get_logger().error(f"Initialization arm goal failed: error_code={future.error_code}."); self._publish_status("error"); return
+            self.get_logger().warn(f"Initialization arm goal reported error: error_code={future.error_code}.")
         if future is not None and hasattr(future, "reached_goal") and (not future.reached_goal or future.stalled):
-            self.get_logger().error(f"Initialization gripper goal failed: reached_goal={future.reached_goal}, stalled={future.stalled}."); self._publish_status("error"); return
+            self.get_logger().warn(f"Initialization gripper stalled/incomplete: reached_goal={getattr(future, 'reached_goal', None)}, stalled={getattr(future, 'stalled', None)}.")
+
+        # Always decrement pending counter to prevent command queue lockout
         self._initialization_goals_pending -= 1
-        if self._initialization_goals_pending == 0: self.initialization_done_callback(future)
+        if self._initialization_goals_pending <= 0:
+            self._initialization_goals_pending = 0
+            self.initialization_done_callback(future)
 
     def _discover_runtime(self):
         if self.get_parameter("mock_mode_enabled").get_parameter_value().bool_value:
@@ -365,14 +369,14 @@ class ComputRhythmArmController(Node):
         self.get_logger().info(f'Randomized behavior choice -> action: "{chosen_action}", mode: "{action_type}", tempo_scale: {tempo_scale}')
         spec = getattr(self, "spec", DEFAULT_SPEC)
         if action_type == "camera":
-            offset, scale, pitch = self._safe_param_array("camera_offset_xyz", (0.0, 0.0, 0.0)), self._safe_param_array("camera_scale_xyz", (1.0, 1.0, 1.0)), self._safe_param_double("camera_preferred_pitch", 0.3)
+            offset, scale, pitch = self._safe_param_array("camera_offset_xyz", (0.0, 0.0, 0.0)), self._safe_param_array("camera_scale_xyz", (1.0, -1.0, 1.0)), self._safe_param_double("camera_preferred_pitch", 0.3)
             arm = solve_open_manipulator_ik(msg_coords.x, msg_coords.y, msg_coords.z, spec=spec, preferred_pitch=pitch, camera_offset_xyz=offset, camera_scale_xyz=scale)
             return arm + [clamp_gripper(OPEN_GRIPPER if chosen_action == "tap" else CLOSED_GRIPPER, spec)]
         if action_type == "interactive": return clamp_pose(self.tap_pose if chosen_action == "tap" else self.grab_pose, spec)
         return clamp_pose(self.home_pose, spec)
 
     def _plan_action(self, action_type: str, command_name: str, tempo_scale: float, msg_coords=None):
-        auto_seq, spec = self._safe_param_bool("auto_return_home", False), getattr(self, "spec", DEFAULT_SPEC)
+        auto_seq, spec = self._safe_param_bool("auto_return_home", True), getattr(self, "spec", DEFAULT_SPEC)
         if action_type in ("camera", "interactive"):
             pose = self._resolve_target_pose(action_type, tempo_scale, msg_coords=msg_coords)
             arm, midpoint = pose[:4], 0.5 * (spec.gripper_limits[0] + spec.gripper_limits[1])
