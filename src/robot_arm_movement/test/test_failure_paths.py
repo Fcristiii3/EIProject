@@ -45,12 +45,13 @@ class ActionFuture:
 class Controller:
     """Slotted controller fake for failure-path unit tests."""
 
-    __slots__ = ("_initialization_goals_pending", "logger", "_active_step_pending", "_active_step_failed", "_pending_steps", "_sequence_active", "_command_queue", "statuses")
+    __slots__ = ("_initialization_goals_pending", "logger", "_active_step_pending", "_active_step_failed", "_pending_steps", "_sequence_active", "_command_queue", "statuses", "init_done_calls", "next_step_calls")
 
     def __init__(self):
         self.logger = FailureLogger()
         self._initialization_goals_pending, self._active_step_pending, self._active_step_failed = 2, 2, False
         self._pending_steps, self._sequence_active, self._command_queue, self.statuses = ["remaining_step"], True, [], []
+        self.init_done_calls, self.next_step_calls = 0, 0
 
     def get_logger(self):
         return self.logger
@@ -60,6 +61,12 @@ class Controller:
 
     def _drain_command_queue(self):
         pass
+
+    def initialization_done_callback(self, future):
+        self.init_done_calls += 1
+
+    def _start_next_step(self):
+        self.next_step_calls += 1
 
 
 @pytest.mark.fault_injection
@@ -91,11 +98,29 @@ def test_gripper_failure_does_not_complete_initialization():
 
 
 @pytest.mark.fault_injection
-def test_failed_initialization_result_is_not_counted():
+def test_failed_initialization_result_still_completes_without_lockout():
     controller = Controller()
     ComputRhythmArmController._initialization_goal_done_callback(controller, ArmResult(error_code=-1))
-    assert controller._initialization_goals_pending == 2
-    assert controller.statuses == ["error"]
+    assert controller._initialization_goals_pending == 1
+    assert controller.init_done_calls == 0
+    ComputRhythmArmController._initialization_goal_done_callback(controller, GripperResult(position=0.0, reached_goal=False, stalled=True))
+    assert controller._initialization_goals_pending == 0
+    assert controller.init_done_calls == 1
+    assert any("Initialization arm goal reported error" in m for m in controller.logger.messages)
+    assert any("Initialization gripper stalled/incomplete" in m for m in controller.logger.messages)
+
+
+@pytest.mark.fault_injection
+def test_stalled_step_gripper_warns_and_continues_sequence():
+    controller = Controller()
+    ComputRhythmArmController._on_step_controller_done(controller, ArmResult(error_code=0))
+    ComputRhythmArmController._on_step_controller_done(controller, GripperResult(position=-0.032, reached_goal=False, stalled=True))
+    assert controller._active_step_failed is False
+    assert controller._sequence_active is True
+    assert controller._pending_steps == ["remaining_step"]
+    assert controller.statuses == []
+    assert controller.next_step_calls == 1
+    assert any("Step gripper stalled/incomplete" in m for m in controller.logger.messages)
 
 
 @pytest.mark.fault_injection

@@ -10,7 +10,7 @@ from launch.actions import DeclareLaunchArgument
 from launch_ros.utilities import evaluate_parameters
 from sensor_msgs.msg import JointState
 from std_msgs.msg import Float64, String
-from robot_arm_movement.arm_controller_node import GRIPPER_MAX_RAD, GRIPPER_MIN_RAD, OPEN_GRIPPER, ComputRhythmArmController, parse_robot_description
+from robot_arm_movement.arm_controller_node import CLOSED_GRIPPER, GRIPPER_MAX_RAD, GRIPPER_MIN_RAD, OPEN_GRIPPER, ComputRhythmArmController, parse_robot_description
 
 SAMPLE_URDF = """<?xml version="1.0"?>
 <robot name="open_manipulator_x">
@@ -49,8 +49,8 @@ def test_parse_robot_description_excludes_mimic_and_orders_chain():
     assert spec.joint3_origin == pytest.approx((0.024, 0.0, 0.128))
     assert spec.end_effector_origin == pytest.approx((0.126, 0.0, 0.0))
     assert spec.arm_limits[0][0] == pytest.approx(-math.pi, abs=1e-4)
-    rad_urdf = SAMPLE_URDF.replace('lower="-0.010" upper="0.019"', f'lower="{math.radians(305.0)}" upper="{math.radians(355.0)}"')
-    assert parse_robot_description(rad_urdf).gripper_limits == pytest.approx((math.radians(305.0), math.radians(355.0)))
+    sub_urdf = SAMPLE_URDF.replace('lower="-0.010" upper="0.019"', 'lower="-0.042" upper="-0.030"')
+    assert parse_robot_description(sub_urdf).gripper_limits == pytest.approx((-0.042, -0.030))
 
 
 @pytest.mark.parametrize("bad_urdf", ["", "<robot/>", "<robot><joint name='j1' type='revolute'><parent link='a'/><child link='b'/></joint></robot>"])
@@ -59,7 +59,7 @@ def test_parse_robot_description_rejects_invalid_urdf(bad_urdf):
 
 
 def test_mock_node_tracks_joint_states_tempo_and_status_sequences():
-    rclpy.init()
+    rclpy.init(args=["--ros-args", "-p", "mock_mode_enabled:=true"])
     node = ComputRhythmArmController()
     statuses = []
     sub = node.create_subscription(String, "/comput_game/arm_status", lambda msg: statuses.append(msg.data), 10)
@@ -106,6 +106,8 @@ def test_launch_file_supports_all_modes(mode, expected_flag):
     eval_params = evaluate_parameters(ctx, arm_nodes[0]._Node__parameters)
     assert eval_params[0]["mock_mode_enabled"] is expected_flag
     assert eval_params[0]["use_sim_time"] is (mode == "gazebo")
+    assert eval_params[0]["gripper_closed_position"] == pytest.approx(CLOSED_GRIPPER)
+    assert eval_params[0]["gripper_open_position"] == pytest.approx(OPEN_GRIPPER)
     if mode == "fake":
         packages = [getattr(a, "_Node__package", None) for a in actions]
         assert "robot_state_publisher" in packages
