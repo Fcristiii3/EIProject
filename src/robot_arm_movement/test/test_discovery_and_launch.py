@@ -10,8 +10,7 @@ from launch.actions import DeclareLaunchArgument
 from launch_ros.utilities import evaluate_parameters
 from sensor_msgs.msg import JointState
 from std_msgs.msg import Float64, String
-from robot_arm_movement.arm_controller_node import ComputRhythmArmController
-from robot_arm_movement.discovery import parse_robot_description
+from robot_arm_movement.arm_controller_node import GRIPPER_MAX_RAD, GRIPPER_MIN_RAD, OPEN_GRIPPER, ComputRhythmArmController, parse_robot_description
 
 SAMPLE_URDF = """<?xml version="1.0"?>
 <robot name="open_manipulator_x">
@@ -46,10 +45,12 @@ def test_parse_robot_description_excludes_mimic_and_orders_chain():
     spec = parse_robot_description(SAMPLE_URDF)
     assert spec.arm_joint_names == ("joint1", "joint2", "joint3", "joint4")
     assert spec.gripper_joint_name == "gripper_left_joint"
-    assert spec.gripper_limits == pytest.approx((-0.010, 0.019))
+    assert spec.gripper_limits == pytest.approx((GRIPPER_MIN_RAD, GRIPPER_MAX_RAD))
     assert spec.joint3_origin == pytest.approx((0.024, 0.0, 0.128))
     assert spec.end_effector_origin == pytest.approx((0.126, 0.0, 0.0))
     assert spec.arm_limits[0][0] == pytest.approx(-math.pi, abs=1e-4)
+    rad_urdf = SAMPLE_URDF.replace('lower="-0.010" upper="0.019"', f'lower="{math.radians(305.0)}" upper="{math.radians(355.0)}"')
+    assert parse_robot_description(rad_urdf).gripper_limits == pytest.approx((math.radians(305.0), math.radians(355.0)))
 
 
 @pytest.mark.parametrize("bad_urdf", ["", "<robot/>", "<robot><joint name='j1' type='revolute'><parent link='a'/><child link='b'/></joint></robot>"])
@@ -66,9 +67,9 @@ def test_mock_node_tracks_joint_states_tempo_and_status_sequences():
         node.set_parameters([rclpy.parameter.Parameter("mock_execution_delay", rclpy.parameter.Parameter.Type.DOUBLE, 0.05), rclpy.parameter.Parameter("auto_return_home", rclpy.parameter.Parameter.Type.BOOL, True), rclpy.parameter.Parameter("camera_action_mode", rclpy.parameter.Parameter.Type.STRING, "grab")])
         _spin_until(node, lambda: "ready" in statuses)
         assert "ready" in statuses
-        node.joint_state_callback(JointState(name=["joint1", "joint2", "joint3", "joint4", "gripper_left_joint"], position=[0.1, -0.2, 0.3, 0.4, 0.01]))
+        node.joint_state_callback(JointState(name=["joint1", "joint2", "joint3", "joint4", "gripper_left_joint"], position=[0.1, -0.2, 0.3, 0.4, OPEN_GRIPPER]))
         assert node.joint_states_received is True
-        assert node.latest_joint_positions["gripper_left_joint"] == pytest.approx(0.01)
+        assert node.latest_joint_positions["gripper_left_joint"] == pytest.approx(OPEN_GRIPPER)
         node.tempo_callback(Float64(data=0.5))
         assert node._get_tempo_scale() == pytest.approx(0.5)
         node.camera_coord_callback(Point(x=0.20, y=0.0, z=0.14))

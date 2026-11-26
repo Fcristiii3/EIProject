@@ -2,7 +2,7 @@
 
 from collections import namedtuple
 import pytest
-from robot_arm_movement.arm_controller_node import ComputRhythmArmController
+from robot_arm_movement.arm_controller_node import OPEN_GRIPPER, ComputRhythmArmController
 
 
 class FailureLogger:
@@ -49,13 +49,8 @@ class Controller:
 
     def __init__(self):
         self.logger = FailureLogger()
-        self._initialization_goals_pending = 2
-        self._active_step_pending = 2
-        self._active_step_failed = False
-        self._pending_steps = ["remaining_step"]
-        self._sequence_active = True
-        self._command_queue = []
-        self.statuses = []
+        self._initialization_goals_pending, self._active_step_pending, self._active_step_failed = 2, 2, False
+        self._pending_steps, self._sequence_active, self._command_queue, self.statuses = ["remaining_step"], True, [], []
 
     def get_logger(self):
         return self.logger
@@ -78,8 +73,7 @@ def test_rejected_goal_is_logged():
 @pytest.mark.fault_injection
 def test_arm_failure_does_not_complete_initialization():
     controller = Controller()
-    result = ArmResult(error_code=-1)
-    callback_called = []
+    result, callback_called = ArmResult(error_code=-1), []
     ComputRhythmArmController.get_result_callback(controller, ActionFuture(ResultResponse(result=result)), "arm", "home", [0.0, -1.0, 0.0, 1.0], callback_called.append)
     assert controller._initialization_goals_pending == 2
     assert callback_called == [result]
@@ -89,9 +83,8 @@ def test_arm_failure_does_not_complete_initialization():
 @pytest.mark.fault_injection
 def test_gripper_failure_does_not_complete_initialization():
     controller = Controller()
-    result = GripperResult(position=0.0, reached_goal=False, stalled=True)
-    callback_called = []
-    ComputRhythmArmController.get_result_callback(controller, ActionFuture(ResultResponse(result=result)), "gripper", "home", 0.015, callback_called.append)
+    result, callback_called = GripperResult(position=0.0, reached_goal=False, stalled=True), []
+    ComputRhythmArmController.get_result_callback(controller, ActionFuture(ResultResponse(result=result)), "gripper", "home", OPEN_GRIPPER, callback_called.append)
     assert controller._initialization_goals_pending == 2
     assert callback_called == [result]
     assert any("success=False" in message for message in controller.logger.messages)

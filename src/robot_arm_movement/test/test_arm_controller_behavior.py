@@ -3,8 +3,7 @@
 import math
 from collections import namedtuple
 import pytest
-from robot_arm_movement.arm_controller_node import ComputRhythmArmController
-from robot_arm_movement.kinematics import CLOSED_GRIPPER, DEFAULT_SPEC, GRAB_HOLD_POSE, GRAB_POSE, HOME_POSE, OPEN_GRIPPER, TAP_POSE, build_grab_sequence, build_place_sequence, build_tap_sequence, clamp_gripper, clamp_pose, forward_kinematics_xyz, solve_open_manipulator_ik
+from robot_arm_movement.arm_controller_node import CLOSED_GRIPPER, DEFAULT_SPEC, GRAB_HOLD_POSE, GRAB_POSE, GRIPPER_MAX_RAD, GRIPPER_MIN_RAD, HOME_POSE, OPEN_GRIPPER, TAP_POSE, ComputRhythmArmController, build_grab_sequence, build_place_sequence, build_tap_sequence, clamp_gripper, clamp_pose, forward_kinematics_xyz, solve_open_manipulator_ik
 
 
 class QuietLogger:
@@ -23,16 +22,8 @@ class ResolutionController:
     __slots__ = ("available_choices", "home_pose", "tap_pose", "grab_pose", "grab_hold_pose", "spec", "holding_cup", "_held_cup_arm_pose", "param_arrays", "get_logger")
 
     def __init__(self):
-        self.available_choices = ["tap", "grab"]
-        self.home_pose = list(HOME_POSE)
-        self.tap_pose = list(TAP_POSE)
-        self.grab_pose = list(GRAB_POSE)
-        self.grab_hold_pose = list(GRAB_HOLD_POSE)
-        self.spec = DEFAULT_SPEC
-        self.holding_cup = False
-        self._held_cup_arm_pose = None
-        self.param_arrays = {}
-        self.get_logger = lambda: QuietLogger()
+        self.available_choices, self.home_pose, self.tap_pose, self.grab_pose, self.grab_hold_pose = ["tap", "grab"], list(HOME_POSE), list(TAP_POSE), list(GRAB_POSE), list(GRAB_HOLD_POSE)
+        self.spec, self.holding_cup, self._held_cup_arm_pose, self.param_arrays, self.get_logger = DEFAULT_SPEC, False, None, {}, lambda: QuietLogger()
 
     def _safe_param_array(self, name, fallback):
         return list(self.param_arrays.get(name, fallback))
@@ -71,16 +62,19 @@ def test_interactive_grab_resolution_returns_grab_pose(monkeypatch):
     assert ComputRhythmArmController._resolve_target_pose(controller, "interactive", 1.0) == controller.grab_pose
 
 
-def test_gripper_limits_clamp_strictly_to_urdf_range():
-    assert clamp_gripper(-0.015) == pytest.approx(-0.010)
-    assert clamp_gripper(0.050) == pytest.approx(0.019)
-    assert clamp_gripper(OPEN_GRIPPER) == pytest.approx(OPEN_GRIPPER)
-    clamped = clamp_pose([10.0, -5.0, 5.0, -5.0, -0.015])
+def test_gripper_limits_clamp_strictly_to_working_range():
+    assert clamp_gripper(0.0) == pytest.approx(GRIPPER_MIN_RAD)
+    assert clamp_gripper(GRIPPER_MIN_RAD - 0.5) == pytest.approx(GRIPPER_MIN_RAD)
+    assert clamp_gripper(GRIPPER_MAX_RAD + 0.5) == pytest.approx(GRIPPER_MAX_RAD)
+    assert clamp_gripper(math.radians(330.0)) == pytest.approx(math.radians(330.0))
+    assert clamp_gripper(CLOSED_GRIPPER) == pytest.approx(GRIPPER_MIN_RAD)
+    assert clamp_gripper(OPEN_GRIPPER) == pytest.approx(GRIPPER_MAX_RAD)
+    clamped = clamp_pose([10.0, -5.0, 5.0, -5.0, 0.0])
     assert clamped[0] == pytest.approx(math.pi)
     assert clamped[1] == pytest.approx(-1.5)
     assert clamped[2] == pytest.approx(1.4)
     assert clamped[3] == pytest.approx(-1.7)
-    assert clamped[4] == pytest.approx(-0.010)
+    assert clamped[4] == pytest.approx(GRIPPER_MIN_RAD)
 
 
 @pytest.mark.parametrize("target", [(0.22, 0.0, 0.14), (0.18, 0.08, 0.10), (0.18, -0.08, 0.12), (0.25, 0.05, 0.16)])
@@ -88,8 +82,7 @@ def test_fk_ik_round_trip_accuracy(target):
     joints = solve_open_manipulator_ik(*target)
     assert len(joints) == 4
     for idx, val in enumerate(joints): assert DEFAULT_SPEC.arm_limits[idx][0] <= val <= DEFAULT_SPEC.arm_limits[idx][1]
-    fx, fy, fz = forward_kinematics_xyz(joints)
-    assert (fx, fy, fz) == pytest.approx(target, abs=1e-3)
+    assert forward_kinematics_xyz(joints) == pytest.approx(target, abs=1e-3)
 
 
 def test_out_of_workspace_ik_is_finite_and_clamped():
@@ -132,10 +125,14 @@ def test_plan_action_remembers_and_places_held_cup(monkeypatch):
     steps, final_status, held_arm = ComputRhythmArmController._plan_action(controller, "camera", "camera", 1.0, Coordinates(x=0.22, y=0.0, z=0.14))
     assert final_status == "done:grab"
     assert len(steps) == 4
-    controller.holding_cup = True
-    controller._held_cup_arm_pose = held_arm
+    controller.holding_cup, controller._held_cup_arm_pose = True, held_arm
     place_steps, place_status, next_held = ComputRhythmArmController._plan_action(controller, "reset", "place", 1.0)
     assert place_status == "done:place"
     assert next_held is None
     assert place_steps[1].pose[:4] == pytest.approx(held_arm)
     assert place_steps[-1].pose == pytest.approx(HOME_POSE)
+    monkeypatch.setattr("robot_arm_movement.arm_controller_node.random.choice", lambda choices: "tap")
+    tap_steps, tap_status, tap_held = ComputRhythmArmController._plan_action(controller, "camera", "camera", 1.0, Coordinates(x=0.22, y=0.0, z=0.14))
+    assert tap_status == "done:tap"
+    assert tap_held is None
+    assert tap_steps[0].pose[4] == pytest.approx(OPEN_GRIPPER)
