@@ -1,0 +1,12 @@
+[tool.ruff]
+line-length = 1000000
+extend-include = ["*.ipynb"]
+
+[tool.ruff.lint]
+ignore = "E501,E701,E702,E231,E401,E302,E305,W503,W504,E225,W292,D204,E301"
+
+[tool.pytest.ini_options]
+markers = [
+    "integration: tests requiring ROS 2 topic communication and a running node",
+    "fault_injection: deterministic tests for controller rejection and failed results",
+]

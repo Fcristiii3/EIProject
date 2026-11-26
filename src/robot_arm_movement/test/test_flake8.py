@@ -12,14 +12,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from ament_flake8.main import main_with_errors
+"""Flake8 linter test using package .flake8 configuration."""
+
+from pathlib import Path
 import pytest
+from ament_flake8.main import main_with_errors
 
 
 @pytest.mark.flake8
 @pytest.mark.linter
 def test_flake8():
-    rc, errors = main_with_errors(argv=[])
-    assert rc == 0, \
-        'Found %d code style errors / warnings:\n' % len(errors) + \
-        '\n'.join(errors)
+    """Verify package Python code complies with .flake8 rules."""
+    config_path = str(Path(__file__).parents[1] / ".flake8")
+    rc, errors = main_with_errors(argv=["--config", config_path])
+    nl = "\n"
+    assert rc == 0, f"Found {len(errors)} code style errors / warnings:\n{nl.join(errors)}"
