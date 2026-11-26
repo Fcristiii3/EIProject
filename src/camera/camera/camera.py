@@ -55,8 +55,7 @@ class CameraNode(Node):
 
         self.cupHistory = []
         self.historyLength = 5
-        self.cupThreshold = 0.015  # 1.5 cm stability threshold (in meters)
-        self.MAX_ARM_REACH = 0.35  # OpenMANIPULATOR-X max reach limit in meters
+        self.cupThreshold = 0.015 
         self.lastCupPixelPos = None
 
         self.gameState = "Human"
@@ -193,25 +192,6 @@ class CameraNode(Node):
 
         return False
 
-    def publishCoordinates(self, x, y):
-        # Reachability check: Clamp target if beyond physical arm workspace radius
-        distance = np.hypot(x, y)
-        if distance > self.MAX_ARM_REACH:
-            self.get_logger().warn(
-                f"Target coordinates ({x:.3f}, {y:.3f}) exceed max reach ({distance:.3f}m > {self.MAX_ARM_REACH}m). Clamping vector."
-            )
-            scale = self.MAX_ARM_REACH / distance
-            x *= scale
-            y *= scale
-
-        point_msg = Point()
-        point_msg.x = float(x)
-        point_msg.y = float(y)
-        point_msg.z = 0.0
-
-        self.get_logger().info(f"Publishing target coordinates -> x={x:.3f}m, y={y:.3f}m")
-        self.robot_pub.publish(point_msg)
-
     def processGame(self, poses, gesture, handLandmarks=None, marker_corners_map=None, frameShape=(480, 640, 3)):
         baseDetected = self.robotBaseID in poses
         cupDetected = self.cupID in poses
@@ -246,14 +226,32 @@ class CameraNode(Node):
         elif self.gameState == "Robot":
             if baseDetected and cupDetected and self.isCupStable():
                 x, y = self.cupHistory[-1]
-                self.publishCoordinates(x, y)
+
+                point_msg = Point()
+                point_msg.x = float(x)
+                point_msg.y = float(y)
+                point_msg.z = 0.0
+
+                self.get_logger().info(f"Publishing {x} and {y}")
+                self.robot_pub.publish(point_msg)
+
                 self.cooldownActive = True
                 self.cooldownStartTime = currentTime
                 self.gameState = "RobotExecuting"
 
             elif baseDetected and len(self.cupHistory) > 0:
                 avgCoords = np.mean(self.cupHistory, axis=0)
-                self.publishCoordinates(avgCoords[0], avgCoords[1])
+                x = float(avgCoords[0])
+                y = float(avgCoords[1])
+
+                point_msg = Point()
+                point_msg.x = float(x)
+                point_msg.y = float(y)
+                point_msg.z = 0.0
+
+                self.get_logger().info(f"Publishing {x} and {y}")
+                self.robot_pub.publish(point_msg)
+
                 self.cooldownActive = True
                 self.cooldownStartTime = currentTime
                 self.gameState = "RobotExecuting"
@@ -278,11 +276,4 @@ class CameraNode(Node):
         return float(std_dev[0]) < self.cupThreshold and float(std_dev[1]) < self.cupThreshold
 
 def main(args=None):
-    rclpy.init(args=args)
-    camera_node = CameraNode()
-    rclpy.spin(camera_node)
-    camera_node.destroy_node()
-    rclpy.shutdown()
-
-if __name__ == '__main__':
-    main()
+    rclpy
