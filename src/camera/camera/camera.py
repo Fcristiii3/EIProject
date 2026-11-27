@@ -65,8 +65,9 @@ class CameraNode(Node):
         self.historyLength = 5
         self.cupThreshold = 0.015
         self.lastCupPixelPos = None
-        self.OFFSET_X = 0.014  
-        self.OFFSET_Y = 0.03 
+        self.lastKnownCupPos = None 
+        self.OFFSET_X = 0.014
+        self.OFFSET_Y = -0.01
 
         self.gameState = "Human"
 
@@ -88,7 +89,6 @@ class CameraNode(Node):
         self.get_logger().info(f"Published tempo scale -> {self.tempo:.2f}")
 
     def update_homography(self, marker_centers_map):
-        """Compute homography matrix H matching exact Marker IDs to physical world points."""
         required_ids = list(self.ARENA_MARKER_WORLD_POS.keys())
 
         if all(m_id in marker_centers_map for m_id in required_ids):
@@ -102,13 +102,12 @@ class CameraNode(Node):
         return False
 
     def pixel_to_world(self, pixel_pt):
-        """Unwarp pixel coordinate (u, v) directly into robot base (x, y) meters."""
         if self.homography_matrix is None:
             return None
         src = np.array([[[pixel_pt[0], pixel_pt[1]]]], dtype=np.float32)
         dst = cv2.perspectiveTransform(src, self.homography_matrix)
         world_x = float(dst[0][0][0]) + self.OFFSET_X
-        world_y = float(dst[0][0][1]) + self.OFSSET_Y
+        world_y = float(dst[0][0][1]) + self.OFFSET_Y
         return world_x, world_y
 
     def arm_status_callback(self, msg: String):
@@ -152,10 +151,8 @@ class CameraNode(Node):
                 marker_corners_map[marker_id_int] = corners[idx]
                 marker_centers_map[marker_id_int] = center
 
-        # Update homography matrix whenever all 4 arena markers (5, 2, 3, 4) are visible
         self.update_homography(marker_centers_map)
 
-        # Track cup position using homography mapping
         if not self.cup_held:
             if self.cupID in marker_centers_map and self.homography_matrix is not None:
                 cup_pixel = marker_centers_map[self.cupID]
@@ -164,6 +161,7 @@ class CameraNode(Node):
 
                 if world_pos is not None:
                     rel_x, rel_y = world_pos
+                    self.lastKnownCupPos = (rel_x, rel_y)
                     self.cupHistory.append((rel_x, rel_y))
                     if len(self.cupHistory) > self.historyLength:
                         self.cupHistory.pop(0)
@@ -194,8 +192,12 @@ class CameraNode(Node):
             (255, 255, 255),
             2,
         )
-        cv2.imshow("camera", frame)
-        cv2.waitKey(1)
+        cv2.imshow("camera", frame) 
+        key = cv2.waitKey(1) & 0xFF
+        if key == ord('r'):
+            self.get_logger().info("Resetting game state to Human turn.")
+            self.gameState = "Human"
+            self.cooldownActive = False
 
     def drawLandmarks(self, frame, handLandmarks):
         h, w, _ = frame.shape
@@ -267,13 +269,17 @@ class CameraNode(Node):
                 near_cup = self.isHandNearCup(handLandmarks, marker_corners_map, frameShape)
 
                 if cupDetected:
-                    if gesture == "PALM" and near_cup and arenaReady:
-                        self.get_logger().info("VALID MOVE: PALM on cup detected.")
-                        self.cooldownActive = True
-                        self.cooldownStartTime = currentTime
-                        self.tempo = random.uniform(1.0, 3.0)
-                        self._publish_tempo()
-                        self.get_logger().info(f"Cooldown active ({self.tempo:.2f}s). Awaiting hand removal...")
+                    if near_cup:
+                        if gesture == "PALM" and arenaReady:
+                            self.get_logger().info("VALID MOVE: PALM on cup detected.")
+                            self.cooldownActive = True
+                            self.cooldownStartTime = currentTime
+                            self.tempo = random.uniform(1.0, 3.0)
+                            self._publish_tempo()
+                            self.get_logger().info(f"Cooldown active ({self.tempo:.2f}s). Awaiting hand removal...")
+                        elif gesture == "FIST":
+                            self.get_logger().error("GAME OVER! FIST on cup is illegal.")
+                            self.gameState = "GameOver_Lost"
 
                 else:
                     if gesture == "FIST":
@@ -283,6 +289,9 @@ class CameraNode(Node):
                         self.tempo = random.uniform(1.0, 3.0)
                         self._publish_tempo()
                         self.get_logger().info(f"Cooldown active ({self.tempo:.2f}s). Awaiting hand removal...")
+                    elif gesture == "PALM":
+                        self.get_logger().error("GAME OVER! PALM on empty space is illegal.")
+                        self.gameState = "GameOver_Lost"
 
             elif self.cooldownActive:
                 elapsed = currentTime - self.cooldownStartTime
@@ -292,6 +301,7 @@ class CameraNode(Node):
                     self.gameState = "Robot"
 
         elif self.gameState == "Robot":
+
             if self.cup_held:
                 self.get_logger().info('Robot holding cup. Publishing "place" action command.')
                 self.action_pub.publish(String(data="place"))
@@ -308,19 +318,19 @@ class CameraNode(Node):
                 self.cooldownStartTime = currentTime
                 self.gameState = "RobotExecuting"
 
-            elif arenaReady and len(self.cupHistory) > 0:
-                avgCoords = np.mean(self.cupHistory, axis=0)
-                point_msg = Point(x=float(avgCoords[0]), y=float(avgCoords[1]), z=0.02)
-                self.get_logger().info(f"Publishing averaged homography target -> x: {point_msg.x:.3f}m, y: {point_msg.y:.3f}m")
+            elif arenaReady and not cupDetected:
+                target_x, target_y = self.lastKnownCupPos if self.lastKnownCupPos is not None else (0.35, 0.0)
+                point_msg = Point(x=float(target_x), y=float(target_y), z=0.02)
+                self.get_logger().info(f"Publishing empty-space target -> x: {target_x:.3f}m, y: {target_y:.3f}m")
                 self.robot_pub.publish(point_msg)
                 self.arm_executing = True
                 self.cooldownStartTime = currentTime
                 self.gameState = "RobotExecuting"
 
             elif not arenaReady:
-                self.get_logger().warn("Arena markers (IDs 2, 3, 4, 5) not all detected. Awaiting homography update.")
+                self.get_logger().warn("Arena markers not all detected. Awaiting homography update.")
             else:
-                self.get_logger().warn("Robot turn active, but no valid cup position available.")
+                self.get_logger().warn("Robot turn active, but no action condition met.")
 
         elif self.gameState == "RobotExecuting":
             if currentTime - self.cooldownStartTime > 20.0:
@@ -328,6 +338,10 @@ class CameraNode(Node):
                 self.arm_executing = False
                 self.cooldownActive = False
                 self.gameState = "Human"
+
+        elif self.gameState == "GameOver_Lost":
+            pass
+
 
     def isCupStable(self):
         """Check if cup coordinates have stabilized within cupThreshold over historyLength frames."""
