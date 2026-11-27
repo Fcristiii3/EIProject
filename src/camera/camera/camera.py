@@ -25,14 +25,18 @@ class CameraNode(Node):
         # Subscriptions
         self.arm_status_sub = self.create_subscription(String, "/comput_game/arm_status", self.arm_status_callback, 10)
 
+
+        self.initial_tempo = 3.0     
+        self.tempo_step = 0.15      
+        self.min_tempo = 1.0        
+        self.tempo = self.initial_tempo
+
         # Game state tracking
-        self.tempo = random.uniform(1.0, 3.0)
         self.cooldownActive = False
         self.cooldownStartTime = 0.0
         self.cup_held = False
         self.arm_executing = False
 
-        # --- 4-CORNER HOMOGRAPHY ARENA CONFIGURATION ---
         self.cupID = 1
 
         self.ARENA_MARKER_WORLD_POS = {
@@ -65,7 +69,7 @@ class CameraNode(Node):
         self.historyLength = 5
         self.cupThreshold = 0.015
         self.lastCupPixelPos = None
-        self.lastKnownCupPos = None 
+        self.lastKnownCupPos = None
         self.OFFSET_X = 0.014
         self.OFFSET_Y = -0.01
 
@@ -86,7 +90,7 @@ class CameraNode(Node):
         msg = Float64()
         msg.data = float(self.tempo)
         self.tempo_pub.publish(msg)
-        self.get_logger().info(f"Published tempo scale -> {self.tempo:.2f}")
+        self.get_logger().info(f"Published tempo scale -> {self.tempo:.2f}s")
 
     def update_homography(self, marker_centers_map):
         required_ids = list(self.ARENA_MARKER_WORLD_POS.keys())
@@ -124,7 +128,13 @@ class CameraNode(Node):
             self.get_logger().info("Cup registered as RELEASED/PLACED.")
 
         if self.gameState == "RobotExecuting" and status in ("done:tap", "done:grab", "done:place", "ready", "error"):
-            self.get_logger().info(f"Arm finished motion with status '{status}'. Transitioning to Human turn!")
+            # Decrease turn delay after each completed robot turn, floored at min_tempo (1.0s)
+            self.tempo = max(self.min_tempo, self.tempo - self.tempo_step)
+            self._publish_tempo()
+
+            self.get_logger().info(
+                f"Arm finished motion ('{status}'). Progressive delay -> {self.tempo:.2f}s. Transitioning to Human turn!"
+            )
             self.arm_executing = False
             self.cooldownActive = False
             self.gameState = "Human"
@@ -185,17 +195,19 @@ class CameraNode(Node):
         calib_status = "OK" if self.homography_matrix is not None else "SEARCHING CORNERS"
         cv2.putText(
             frame,
-            f"Game State: {self.gameState} | Arena: {calib_status}",
+            f"Game State: {self.gameState} | Delay: {self.tempo:.2f}s | Arena: {calib_status}",
             (10, 30),
             cv2.FONT_HERSHEY_SIMPLEX,
-            0.6,
+            0.55,
             (255, 255, 255),
             2,
         )
-        cv2.imshow("camera", frame) 
+        cv2.imshow("camera", frame)
         key = cv2.waitKey(1) & 0xFF
         if key == ord('r'):
-            self.get_logger().info("Resetting game state to Human turn.")
+            self.get_logger().info("Resetting game state and restoring starting tempo delay (3.0s).")
+            self.tempo = self.initial_tempo
+            self._publish_tempo()
             self.gameState = "Human"
             self.cooldownActive = False
 
@@ -274,7 +286,6 @@ class CameraNode(Node):
                             self.get_logger().info("VALID MOVE: PALM on cup detected.")
                             self.cooldownActive = True
                             self.cooldownStartTime = currentTime
-                            self.tempo = random.uniform(1.0, 3.0)
                             self._publish_tempo()
                             self.get_logger().info(f"Cooldown active ({self.tempo:.2f}s). Awaiting hand removal...")
                         elif gesture == "FIST":
@@ -286,7 +297,6 @@ class CameraNode(Node):
                         self.get_logger().info("VALID MOVE: FIST on empty space detected.")
                         self.cooldownActive = True
                         self.cooldownStartTime = currentTime
-                        self.tempo = random.uniform(1.0, 3.0)
                         self._publish_tempo()
                         self.get_logger().info(f"Cooldown active ({self.tempo:.2f}s). Awaiting hand removal...")
                     elif gesture == "PALM":
@@ -342,9 +352,8 @@ class CameraNode(Node):
         elif self.gameState == "GameOver_Lost":
             pass
 
-
     def isCupStable(self):
-        """Check if cup coordinates have stabilized within cupThreshold over historyLength frames."""
+
         if len(self.cupHistory) < self.historyLength:
             return False
         coord = np.array(self.cupHistory)
