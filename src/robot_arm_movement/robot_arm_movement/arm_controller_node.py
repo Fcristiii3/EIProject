@@ -15,7 +15,7 @@ from sensor_msgs.msg import JointState
 from std_msgs.msg import Float64, String
 from trajectory_msgs.msg import JointTrajectoryPoint
 
-CLOSED_GRIPPER, OPEN_GRIPPER = -0.03, -0.045
+CLOSED_GRIPPER, OPEN_GRIPPER = -0.008, 0.008
 GRIPPER_MIN_RAD, GRIPPER_MAX_RAD = min(CLOSED_GRIPPER, OPEN_GRIPPER), max(CLOSED_GRIPPER, OPEN_GRIPPER)
 HOME_POSE = [0.0, -1.0, 0.0, 1.0, OPEN_GRIPPER]
 TAP_POSE = [0.0, -1.0, 0.0, 1.0, OPEN_GRIPPER]
@@ -99,7 +99,7 @@ def forward_kinematics_xyz(arm_joints: Sequence[float], spec: RobotKinematicsSpe
     return (x1 + r * math.cos(q1) - y2 * math.sin(q1), y1 + r * math.sin(q1) + y2 * math.cos(q1), z)
 
 
-def solve_open_manipulator_ik(x: float, y: float, z: float, spec: RobotKinematicsSpec = DEFAULT_SPEC, preferred_pitch: float = 0.3, camera_offset_xyz: Sequence[float] = (0.0, 0.0, 0.0), camera_scale_xyz: Sequence[float] = (1.0, -1.0, 1.0)) -> List[float]:
+def solve_open_manipulator_ik(x: float, y: float, z: float, spec: RobotKinematicsSpec = DEFAULT_SPEC, preferred_pitch: float = 0.3, camera_offset_xyz: Sequence[float] = (0.0, 0.0, 0.0), camera_scale_xyz: Sequence[float] = (1.0, 1.0, 1.0)) -> List[float]:
     """Solve analytical 4-DOF OpenMANIPULATOR-X IK with radial clamping and pitch fallback."""
     tx = float(x) * float(camera_scale_xyz[0]) + float(camera_offset_xyz[0])
     ty = float(y) * float(camera_scale_xyz[1]) + float(camera_offset_xyz[1])
@@ -283,7 +283,7 @@ class ComputRhythmArmController(Node):
         self.tempo_pub = self.create_publisher(Float64, "/comput_game/tempo", 10)
         self.declare_parameter("tempo_scale", 1.0); self.declare_parameter("mock_mode_enabled", False); self.declare_parameter("mock_execution_delay", 0.3)
         self.declare_parameter("controller_discovery_timeout_sec", 15.0); self.declare_parameter("auto_return_home", True); self.declare_parameter("grab_hold_duration_sec", 0.0)
-        self.declare_parameter("grab_hold_pose", list(GRAB_HOLD_POSE)); self.declare_parameter("camera_offset_xyz", [0.0, 0.0, 0.0]); self.declare_parameter("camera_scale_xyz", [1.0, -1.0, 1.0])
+        self.declare_parameter("grab_hold_pose", list(GRAB_HOLD_POSE)); self.declare_parameter("camera_offset_xyz", [0.0, 0.0, 0.0]); self.declare_parameter("camera_scale_xyz", [1.0, 1.0, 1.0])
         self.declare_parameter("camera_preferred_pitch", 0.3); self.declare_parameter("camera_action_mode", "random")
         self.declare_parameter("gripper_closed_position", float(CLOSED_GRIPPER)); self.declare_parameter("gripper_open_position", float(OPEN_GRIPPER))
         self.spec, self.arm_joint_names, self.gripper_joint_name = DEFAULT_SPEC, None, None
@@ -382,7 +382,7 @@ class ComputRhythmArmController(Node):
         closed_pos = self._safe_param_double("gripper_closed_position", CLOSED_GRIPPER)
         spec = _spec_with_gripper_range(getattr(self, "spec", DEFAULT_SPEC), open_pos, closed_pos)
         if action_type == "camera":
-            offset, scale, pitch = self._safe_param_array("camera_offset_xyz", (0.0, 0.0, 0.0)), self._safe_param_array("camera_scale_xyz", (1.0, -1.0, 1.0)), self._safe_param_double("camera_preferred_pitch", 0.3)
+            offset, scale, pitch = self._safe_param_array("camera_offset_xyz", (0.0, 0.0, 0.0)), self._safe_param_array("camera_scale_xyz", (1.0, 1.0, 1.0)), self._safe_param_double("camera_preferred_pitch", 0.3)
             arm = solve_open_manipulator_ik(msg_coords.x, msg_coords.y, msg_coords.z, spec=spec, preferred_pitch=pitch, camera_offset_xyz=offset, camera_scale_xyz=scale)
             return arm + [clamp_gripper(open_pos if chosen_action == "tap" else closed_pos, spec)]
         if action_type == "interactive":
