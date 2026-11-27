@@ -20,6 +20,8 @@ def _launch_setup(context, *args, **kwargs):
     tempo_scale = float(LaunchConfiguration("tempo_scale").perform(context))
     discovery_timeout = float(LaunchConfiguration("controller_discovery_timeout_sec").perform(context))
     camera_action_mode = LaunchConfiguration("camera_action_mode").perform(context)
+    gripper_closed_position = float(LaunchConfiguration("gripper_closed_position").perform(context))
+    gripper_open_position = float(LaunchConfiguration("gripper_open_position").perform(context))
     if mode not in ("hardware", "fake", "gazebo", "attach", "mock"): raise ValueError(f"Unsupported launch mode: {mode!r}")
     actions = []
     if mode == "hardware":
@@ -38,7 +40,7 @@ def _launch_setup(context, *args, **kwargs):
             jsb_spawner,
             RegisterEventHandler(OnProcessExit(target_action=jsb_spawner, on_exit=[arm_spawner, grip_spawner])),
         ])
-    arm_params = {"mock_mode_enabled": mode == "mock", "auto_return_home": auto_return_home, "grab_hold_duration_sec": grab_hold_duration_sec, "tempo_scale": tempo_scale, "controller_discovery_timeout_sec": discovery_timeout, "camera_action_mode": camera_action_mode, "use_sim_time": mode == "gazebo"}
+    arm_params = {"mock_mode_enabled": mode == "mock", "auto_return_home": auto_return_home, "grab_hold_duration_sec": grab_hold_duration_sec, "tempo_scale": tempo_scale, "controller_discovery_timeout_sec": discovery_timeout, "camera_action_mode": camera_action_mode, "gripper_closed_position": gripper_closed_position, "gripper_open_position": gripper_open_position, "use_sim_time": mode == "gazebo"}
     actions.append(Node(package="robot_arm_movement", executable="arm_controller_node", name="comput_rhythm_arm_controller", parameters=[arm_params], output="screen"))
     actions.append(Node(package="camera", executable="camera_node", output="screen", condition=IfCondition(LaunchConfiguration("launch_camera"))))
     return actions
@@ -56,5 +58,7 @@ def generate_launch_description():
         DeclareLaunchArgument("controller_discovery_timeout_sec", default_value="15.0", description="Timeout for URDF and controller discovery."),
         DeclareLaunchArgument("start_rviz", default_value="false", description="Start RViz2 when supported by bringup mode."),
         DeclareLaunchArgument("camera_action_mode", default_value="random", description="Camera action selection: random, tap, or grab."),
+        DeclareLaunchArgument("gripper_closed_position", default_value="-0.027", description="Gripper closed position target."),
+        DeclareLaunchArgument("gripper_open_position", default_value="-0.045", description="Gripper open position target."),
         OpaqueFunction(function=_launch_setup),
     ])

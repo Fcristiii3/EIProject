@@ -1,7 +1,7 @@
 """ROS 2 node, 4-DOF kinematics, and URDF discovery for OpenMANIPULATOR-X arm and gripper."""
 
 import functools, math, random, sys, time, xml.etree.ElementTree as ET
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Dict, List, Optional, Sequence, Tuple
 import rclpy
 from builtin_interfaces.msg import Duration
@@ -15,11 +15,11 @@ from sensor_msgs.msg import JointState
 from std_msgs.msg import Float64, String
 from trajectory_msgs.msg import JointTrajectoryPoint
 
-GRIPPER_MIN_RAD, GRIPPER_MAX_RAD = -0.027,-0.045
-CLOSED_GRIPPER, OPEN_GRIPPER =   GRIPPER_MIN_RAD, GRIPPER_MAX_RAD
+CLOSED_GRIPPER, OPEN_GRIPPER = -0.027, -0.045
+GRIPPER_MIN_RAD, GRIPPER_MAX_RAD = min(CLOSED_GRIPPER, OPEN_GRIPPER), max(CLOSED_GRIPPER, OPEN_GRIPPER)
 HOME_POSE = [0.0, -1.0, 0.0, 1.0, OPEN_GRIPPER]
-TAP_POSE = [0.0, -1.0, 0.0, 1.0, CLOSED_GRIPPER]
-GRAB_POSE = [0.0, -1.0, 0.0, 1.0, OPEN_GRIPPER]
+TAP_POSE = [0.0, -1.0, 0.0, 1.0, OPEN_GRIPPER]
+GRAB_POSE = [0.0, -1.0, 0.0, 1.0, CLOSED_GRIPPER]
 GRAB_HOLD_POSE = [0.0, -1.0, 0.0, 1.0, CLOSED_GRIPPER]
 
 
@@ -63,7 +63,8 @@ class DiscoveredRuntime:
 
 def clamp(value: float, low: float, high: float) -> float:
     """Clamp numeric value to inclusive [low, high] range."""
-    return max(float(low), min(float(high), float(value)))
+    lo, hi = (float(low), float(high)) if float(low) <= float(high) else (float(high), float(low))
+    return max(lo, min(hi, float(value)))
 
 
 def clamp_gripper(value: float, spec: RobotKinematicsSpec = DEFAULT_SPEC) -> float:
@@ -79,6 +80,13 @@ def clamp_arm_joints(joints: Sequence[float], spec: RobotKinematicsSpec = DEFAUL
 def clamp_pose(pose: Sequence[float], spec: RobotKinematicsSpec = DEFAULT_SPEC) -> List[float]:
     """Clamp a 5-element [joint1..joint4, gripper] pose to physical limits."""
     return clamp_arm_joints(pose[:4], spec) + [clamp_gripper(pose[4], spec)]
+
+
+def _spec_with_gripper_range(spec: RobotKinematicsSpec, open_gripper: float, closed_gripper: float) -> RobotKinematicsSpec:
+    lo, hi = min(float(open_gripper), float(closed_gripper)), max(float(open_gripper), float(closed_gripper))
+    if abs(lo - GRIPPER_MIN_RAD) > 1e-9 or abs(hi - GRIPPER_MAX_RAD) > 1e-9:
+        return replace(spec, gripper_limits=(lo, hi))
+    return spec
 
 
 def forward_kinematics_xyz(arm_joints: Sequence[float], spec: RobotKinematicsSpec = DEFAULT_SPEC) -> Tuple[float, float, float]:
@@ -134,26 +142,27 @@ def _lift_pose(arm_pose: Sequence[float], gripper_pos: float, spec: RobotKinemat
     return clamp_arm_joints([arm_pose[0], -0.8, 0.1, 0.7], spec) + [clamp_gripper(gripper_pos, spec)]
 
 
-def build_tap_sequence(cmd: str, arm_pose: Sequence[float], home_pose: Sequence[float] = HOME_POSE, spec: RobotKinematicsSpec = DEFAULT_SPEC, auto_sequence_enabled: bool = True) -> List[MotionStep]:
+def build_tap_sequence(cmd: str, arm_pose: Sequence[float], home_pose: Sequence[float] = HOME_POSE, spec: RobotKinematicsSpec = DEFAULT_SPEC, auto_sequence_enabled: bool = True, open_gripper: float = OPEN_GRIPPER) -> List[MotionStep]:
     """Build single-step or auto-retracting tap sequence keeping the cup on the table."""
-    tap_step = MotionStep(cmd, clamp_arm_joints(arm_pose, spec) + [clamp_gripper(OPEN_GRIPPER, spec)], 1.0)
-    return [tap_step] if not auto_sequence_enabled else [tap_step, MotionStep(f"{cmd}_return", clamp_pose(home_pose, spec), 1.0)]
+    open_pos = clamp_gripper(open_gripper, spec)
+    tap_step = MotionStep(cmd, clamp_arm_joints(arm_pose, spec) + [open_pos], 1.0)
+    return [tap_step] if not auto_sequence_enabled else [tap_step, MotionStep(f"{cmd}_return", clamp_arm_joints(home_pose[:4], spec) + [open_pos], 1.0)]
 
 
-def build_grab_sequence(cmd: str, arm_pose: Sequence[float], grab_hold_pose: Sequence[float] = GRAB_HOLD_POSE, spec: RobotKinematicsSpec = DEFAULT_SPEC, auto_sequence_enabled: bool = True) -> List[MotionStep]:
+def build_grab_sequence(cmd: str, arm_pose: Sequence[float], grab_hold_pose: Sequence[float] = GRAB_HOLD_POSE, spec: RobotKinematicsSpec = DEFAULT_SPEC, auto_sequence_enabled: bool = True, open_gripper: float = OPEN_GRIPPER, closed_gripper: float = CLOSED_GRIPPER) -> List[MotionStep]:
     """Build approach -> close -> vertical lift -> side hold sequence clearing the cup from FOV."""
-    open_pos, closed_pos = clamp_gripper(OPEN_GRIPPER, spec), clamp_gripper(CLOSED_GRIPPER, spec)
+    open_pos, closed_pos = clamp_gripper(open_gripper, spec), clamp_gripper(closed_gripper, spec)
     arm = clamp_arm_joints(arm_pose, spec)
     if not auto_sequence_enabled: return [MotionStep(cmd, arm + [closed_pos], 1.0)]
     hold = clamp_arm_joints(grab_hold_pose[:4], spec) + [closed_pos]
     return [MotionStep(f"{cmd}_approach", arm + [open_pos], 0.8), MotionStep(cmd, arm + [closed_pos], 0.6), MotionStep(f"{cmd}_lift", _lift_pose(arm, closed_pos, spec), 0.7), MotionStep(f"{cmd}_hold", hold, 1.0)]
 
 
-def build_place_sequence(cmd: str, held_arm_pose: Sequence[float], home_pose: Sequence[float] = HOME_POSE, spec: RobotKinematicsSpec = DEFAULT_SPEC) -> List[MotionStep]:
+def build_place_sequence(cmd: str, held_arm_pose: Sequence[float], home_pose: Sequence[float] = HOME_POSE, spec: RobotKinematicsSpec = DEFAULT_SPEC, open_gripper: float = OPEN_GRIPPER, closed_gripper: float = CLOSED_GRIPPER) -> List[MotionStep]:
     """Build carry-back -> lower -> release -> home sequence returning the cup to the table."""
-    open_pos, closed_pos = clamp_gripper(OPEN_GRIPPER, spec), clamp_gripper(CLOSED_GRIPPER, spec)
+    open_pos, closed_pos = clamp_gripper(open_gripper, spec), clamp_gripper(closed_gripper, spec)
     held = clamp_arm_joints(held_arm_pose, spec)
-    return [MotionStep(f"{cmd}_carry", _lift_pose(held, closed_pos, spec), 1.0), MotionStep(f"{cmd}_lower", held + [closed_pos], 0.8), MotionStep(f"{cmd}_release", held + [open_pos], 0.6), MotionStep(cmd, clamp_pose(home_pose, spec), 1.0)]
+    return [MotionStep(f"{cmd}_carry", _lift_pose(held, closed_pos, spec), 1.0), MotionStep(f"{cmd}_lower", held + [closed_pos], 0.8), MotionStep(f"{cmd}_release", held + [open_pos], 0.6), MotionStep(cmd, clamp_arm_joints(home_pose[:4], spec) + [open_pos], 1.0)]
 
 
 def _parse_xyz(text: Optional[str], fallback: Tuple[float, float, float]) -> Tuple[float, float, float]:
@@ -276,9 +285,11 @@ class ComputRhythmArmController(Node):
         self.declare_parameter("controller_discovery_timeout_sec", 15.0); self.declare_parameter("auto_return_home", True); self.declare_parameter("grab_hold_duration_sec", 0.0)
         self.declare_parameter("grab_hold_pose", list(GRAB_HOLD_POSE)); self.declare_parameter("camera_offset_xyz", [0.0, 0.0, 0.0]); self.declare_parameter("camera_scale_xyz", [1.0, -1.0, 1.0])
         self.declare_parameter("camera_preferred_pitch", 0.3); self.declare_parameter("camera_action_mode", "random")
+        self.declare_parameter("gripper_closed_position", float(CLOSED_GRIPPER)); self.declare_parameter("gripper_open_position", float(OPEN_GRIPPER))
         self.spec, self.arm_joint_names, self.gripper_joint_name = DEFAULT_SPEC, None, None
         self.runtime_ready, self.joint_states_received, self.latest_joint_names, self.latest_joint_positions = False, False, [], {}
-        self.home_pose, self.tap_pose, self.grab_pose, self.grab_hold_pose = list(HOME_POSE), list(TAP_POSE), list(GRAB_POSE), list(GRAB_HOLD_POSE)
+        open_pos, closed_pos = self._safe_param_double("gripper_open_position", OPEN_GRIPPER), self._safe_param_double("gripper_closed_position", CLOSED_GRIPPER)
+        self.home_pose, self.tap_pose, self.grab_pose, self.grab_hold_pose = list(HOME_POSE[:4]) + [open_pos], list(TAP_POSE[:4]) + [open_pos], list(GRAB_POSE[:4]) + [closed_pos], list(GRAB_HOLD_POSE[:4]) + [closed_pos]
         self.pose_split_arm_gripper, self.available_choices = 4, ["tap", "grab"]
         self.interactive_commands, self.reset_commands = ["interact", "cup", "box"], ["place", "cloth", "reset", "home"]
         self.holding_cup, self._held_cup_arm_pose, self._initialization_goals_pending = False, None, 2
@@ -367,28 +378,40 @@ class ComputRhythmArmController(Node):
     def _resolve_target_pose(self, action_type, tempo_scale, msg_coords=None):
         chosen_action = self._choose_action()
         self.get_logger().info(f'Randomized behavior choice -> action: "{chosen_action}", mode: "{action_type}", tempo_scale: {tempo_scale}')
-        spec = getattr(self, "spec", DEFAULT_SPEC)
+        open_pos = self._safe_param_double("gripper_open_position", OPEN_GRIPPER)
+        closed_pos = self._safe_param_double("gripper_closed_position", CLOSED_GRIPPER)
+        spec = _spec_with_gripper_range(getattr(self, "spec", DEFAULT_SPEC), open_pos, closed_pos)
         if action_type == "camera":
             offset, scale, pitch = self._safe_param_array("camera_offset_xyz", (0.0, 0.0, 0.0)), self._safe_param_array("camera_scale_xyz", (1.0, -1.0, 1.0)), self._safe_param_double("camera_preferred_pitch", 0.3)
             arm = solve_open_manipulator_ik(msg_coords.x, msg_coords.y, msg_coords.z, spec=spec, preferred_pitch=pitch, camera_offset_xyz=offset, camera_scale_xyz=scale)
-            return arm + [clamp_gripper(OPEN_GRIPPER if chosen_action == "tap" else CLOSED_GRIPPER, spec)]
-        if action_type == "interactive": return clamp_pose(self.tap_pose if chosen_action == "tap" else self.grab_pose, spec)
-        return clamp_pose(self.home_pose, spec)
+            return arm + [clamp_gripper(open_pos if chosen_action == "tap" else closed_pos, spec)]
+        if action_type == "interactive":
+            base_pose = self.tap_pose if chosen_action == "tap" else self.grab_pose
+            return clamp_pose(list(base_pose[:4]) + [open_pos if chosen_action == "tap" else closed_pos], spec)
+        return clamp_pose(list(self.home_pose[:4]) + [open_pos], spec)
 
     def _plan_action(self, action_type: str, command_name: str, tempo_scale: float, msg_coords=None):
-        auto_seq, spec = self._safe_param_bool("auto_return_home", True), getattr(self, "spec", DEFAULT_SPEC)
+        auto_seq = self._safe_param_bool("auto_return_home", True)
+        open_pos = self._safe_param_double("gripper_open_position", OPEN_GRIPPER)
+        closed_pos = self._safe_param_double("gripper_closed_position", CLOSED_GRIPPER)
+        spec = _spec_with_gripper_range(getattr(self, "spec", DEFAULT_SPEC), open_pos, closed_pos)
+        home_pose = list(self.home_pose[:4]) + [open_pos]
         if action_type in ("camera", "interactive"):
+            if self.holding_cup:
+                held = self._held_cup_arm_pose if self._held_cup_arm_pose is not None else list(self.grab_pose[:4])
+                return build_place_sequence(command_name, held, home_pose=home_pose, spec=spec, open_gripper=open_pos, closed_gripper=closed_pos), "done:place", None
             pose = self._resolve_target_pose(action_type, tempo_scale, msg_coords=msg_coords)
-            arm, midpoint = pose[:4], 0.5 * (spec.gripper_limits[0] + spec.gripper_limits[1])
-            if pose[4] >= midpoint: return build_tap_sequence(command_name, arm, home_pose=self.home_pose, spec=spec, auto_sequence_enabled=auto_seq), "done:tap", None
+            arm = pose[:4]
+            if abs(pose[4] - open_pos) <= abs(pose[4] - closed_pos):
+                return build_tap_sequence(command_name, arm, home_pose=home_pose, spec=spec, auto_sequence_enabled=auto_seq, open_gripper=open_pos), "done:tap", None
             hold_pose = self._safe_param_array("grab_hold_pose", self.grab_hold_pose)
-            return build_grab_sequence(command_name, arm, grab_hold_pose=hold_pose, spec=spec, auto_sequence_enabled=auto_seq), "done:grab", list(arm)
+            return build_grab_sequence(command_name, arm, grab_hold_pose=hold_pose, spec=spec, auto_sequence_enabled=auto_seq, open_gripper=open_pos, closed_gripper=closed_pos), "done:grab", list(arm)
         if command_name == "place" or (command_name == "reset" and self.holding_cup):
             if self.holding_cup:
                 held = self._held_cup_arm_pose if self._held_cup_arm_pose is not None else list(self.grab_pose[:4])
-                return build_place_sequence(command_name, held, home_pose=self.home_pose, spec=spec), "done:place", None
-            return [MotionStep(command_name, clamp_pose(self.home_pose, spec), 1.0)], "done:place", None
-        return [MotionStep(command_name, clamp_pose(self.home_pose, spec), 1.0)], "done:home" if command_name == "home" else "done:reset", None
+                return build_place_sequence(command_name, held, home_pose=home_pose, spec=spec, open_gripper=open_pos, closed_gripper=closed_pos), "done:place", None
+            return [MotionStep(command_name, clamp_pose(home_pose, spec), 1.0)], "done:place", None
+        return [MotionStep(command_name, clamp_pose(home_pose, spec), 1.0)], "done:home" if command_name == "home" else "done:reset", None
 
     def _cancel_grab_release_timer(self):
         if self._grab_release_timer is not None: self._grab_release_timer.cancel(); self._grab_release_timer = None
@@ -428,7 +451,8 @@ class ComputRhythmArmController(Node):
 
     def _on_step_controller_done(self, result):
         if result is not None and hasattr(result, "error_code") and result.error_code != 0: self._active_step_failed = True
-        if result is not None and hasattr(result, "reached_goal") and (not result.reached_goal or result.stalled): self._active_step_failed = True
+        if result is not None and hasattr(result, "reached_goal") and (not result.reached_goal or result.stalled):
+            self.get_logger().warn(f"Step gripper stalled/incomplete (continuing sequence): reached_goal={getattr(result, 'reached_goal', None)}, stalled={getattr(result, 'stalled', None)}.")
         self._active_step_pending -= 1
         if self._active_step_pending > 0: return
         if self._active_step_failed:
@@ -458,7 +482,10 @@ class ComputRhythmArmController(Node):
 
     def send_trajectory_goal(self, positions, duration_sec, command_name="command", callback=None, max_effort=5.0):
         """Clamp and dispatch separate arm trajectory and gripper command goals."""
-        clamped = clamp_pose(positions, getattr(self, "spec", DEFAULT_SPEC))
+        open_pos = self._safe_param_double("gripper_open_position", OPEN_GRIPPER)
+        closed_pos = self._safe_param_double("gripper_closed_position", CLOSED_GRIPPER)
+        spec = _spec_with_gripper_range(getattr(self, "spec", DEFAULT_SPEC), open_pos, closed_pos)
+        clamped = clamp_pose(positions, spec)
         arm_positions, gripper_position = clamped[:self.pose_split_arm_gripper], clamped[self.pose_split_arm_gripper]
         if self.get_parameter("mock_mode_enabled").get_parameter_value().bool_value:
             self._mock_command, self._mock_target, self._mock_gripper_target, self._mock_callback = command_name, arm_positions, gripper_position, callback
