@@ -15,7 +15,7 @@ from sensor_msgs.msg import JointState
 from std_msgs.msg import Float64, String
 from trajectory_msgs.msg import JointTrajectoryPoint
 
-CLOSED_GRIPPER, OPEN_GRIPPER = -0.027, -0.045
+CLOSED_GRIPPER, OPEN_GRIPPER = -0.03, -0.045
 GRIPPER_MIN_RAD, GRIPPER_MAX_RAD = min(CLOSED_GRIPPER, OPEN_GRIPPER), max(CLOSED_GRIPPER, OPEN_GRIPPER)
 HOME_POSE = [0.0, -1.0, 0.0, 1.0, OPEN_GRIPPER]
 TAP_POSE = [0.0, -1.0, 0.0, 1.0, OPEN_GRIPPER]
