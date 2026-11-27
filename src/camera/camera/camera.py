@@ -35,25 +35,12 @@ class CameraNode(Node):
         # --- 4-CORNER HOMOGRAPHY ARENA CONFIGURATION ---
         self.cupID = 1
 
-        self.ARENA_IDS = {
-            "top_left": 2,
-            "top_right": 3,
-            "bottom_right": 4,
-            "bottom_left": 5,
+        self.ARENA_MARKER_WORLD_POS = {
+            5: [0.28, 0.30],
+            2: [0.52, 0.30],
+            3: [0.52, -0.30],
+            4: [0.28, -0.30],
         }
-
-        # Physical marker coordinates (in meters relative to robot base origin (0,0))
-        # ID 2: x=+0.52m, y=+0.30m | ID 3: x=+0.52m, y=-0.30m
-        # ID 4: x=+0.28m, y=-0.30m | ID 5: x=+0.28m, y=+0.30m
-        self.ARENA_WORLD_PTS = np.array(
-            [
-                [0.52, 0.30],   # Top-Left (ID 2)
-                [0.52, -0.30],  # Top-Right (ID 3)
-                [0.28, -0.30],  # Bottom-Right (ID 4)
-                [0.28, 0.30],   # Bottom-Left (ID 5)
-            ],
-            dtype=np.float32,
-        )
 
         self.homography_matrix = None
 
@@ -78,6 +65,8 @@ class CameraNode(Node):
         self.historyLength = 5
         self.cupThreshold = 0.015
         self.lastCupPixelPos = None
+        self.OFFSET_X = 0.014  
+        self.OFFSET_Y = 0.03 
 
         self.gameState = "Human"
 
@@ -99,26 +88,14 @@ class CameraNode(Node):
         self.get_logger().info(f"Published tempo scale -> {self.tempo:.2f}")
 
     def update_homography(self, marker_centers_map):
-        """Compute homography matrix H when all 4 arena corner markers are detected."""
-        required_ids = [
-            self.ARENA_IDS["top_left"],
-            self.ARENA_IDS["top_right"],
-            self.ARENA_IDS["bottom_right"],
-            self.ARENA_IDS["bottom_left"],
-        ]
+        """Compute homography matrix H matching exact Marker IDs to physical world points."""
+        required_ids = list(self.ARENA_MARKER_WORLD_POS.keys())
 
         if all(m_id in marker_centers_map for m_id in required_ids):
-            img_pts = np.array(
-                [
-                    marker_centers_map[self.ARENA_IDS["top_left"]],
-                    marker_centers_map[self.ARENA_IDS["top_right"]],
-                    marker_centers_map[self.ARENA_IDS["bottom_right"]],
-                    marker_centers_map[self.ARENA_IDS["bottom_left"]],
-                ],
-                dtype=np.float32,
-            )
+            img_pts = np.array([marker_centers_map[m_id] for m_id in required_ids], dtype=np.float32)
+            world_pts = np.array([self.ARENA_MARKER_WORLD_POS[m_id] for m_id in required_ids], dtype=np.float32)
 
-            H, status = cv2.findHomography(img_pts, self.ARENA_WORLD_PTS)
+            H, status = cv2.findHomography(img_pts, world_pts)
             if H is not None:
                 self.homography_matrix = H
                 return True
@@ -130,8 +107,8 @@ class CameraNode(Node):
             return None
         src = np.array([[[pixel_pt[0], pixel_pt[1]]]], dtype=np.float32)
         dst = cv2.perspectiveTransform(src, self.homography_matrix)
-        world_x = float(dst[0][0][0])
-        world_y = float(dst[0][0][1])
+        world_x = float(dst[0][0][0]) + self.OFFSET_X
+        world_y = float(dst[0][0][1]) + self.OFSSET_Y
         return world_x, world_y
 
     def arm_status_callback(self, msg: String):
@@ -175,7 +152,7 @@ class CameraNode(Node):
                 marker_corners_map[marker_id_int] = corners[idx]
                 marker_centers_map[marker_id_int] = center
 
-        # Update homography matrix whenever all 4 arena markers are visible
+        # Update homography matrix whenever all 4 arena markers (5, 2, 3, 4) are visible
         self.update_homography(marker_centers_map)
 
         # Track cup position using homography mapping
